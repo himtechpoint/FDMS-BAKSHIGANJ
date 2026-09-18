@@ -393,184 +393,6 @@ const FORM_FIELD_CONFIG = [
 ];
 const DEFAULT_FORM_FIELD_SETTINGS = { landArea: true, mouza: false, dagNumber: false, khatianNumber: false, cropName: true };
 
-/* ---------------- dealer stock management (new) ----------------
-   TWO DELIBERATELY SEPARATE SCHEMAS — this is the whole point of this
-   design, so it's worth spelling out clearly:
-     1. dealerStock/{dealerId}/{fertilizer} = { received, distributed, available }
-        — ONLY the current running totals for that dealer+fertilizer. Every
-        distribution to a farmer (deductDealerStock) and every stock receipt
-        (handleAddStockSubmit) updates ONLY this small node via runTransaction.
-        Stays tiny regardless of scale (bounded by dealer-count ×
-        fertilizer-count, NOT by distribution-count or transaction-count), so
-        it is safely loaded whole in one read for the admin "সব ডিলারের স্টক"
-        dashboard, exactly like the existing `dealers` node already is.
-     2. stockHistory/{dealerId}/{historyId} = { dealerName, fertilizer,
-        transactionType, quantity, previousStock, newStock, addedBy,
-        addedByName, note, date, createdAt } — the detailed per-transaction
-        ledger/"info", nested directly under each dealer's own key instead of
-        a flat top-level list with an .indexOn — so reading one dealer's
-        history is a plain, index-free path read
-        (stockHistory/{dealerId}, orderByKey+limitToLast — see
-        loadStockHistoryForDealer), not a query scanning/filtering a
-        shared table.
-   WHY NOT nest #2 INSIDE #1 (e.g. dealerStock/{dealerId}/{fertilizer}/history/{id})
-   even though that reads as the more literal "embed the transactions in the
-   stock node": the Realtime Database client SDK has no way to fetch part of
-   a node — a get() on dealerStock (or even dealerStock/{dealerId}) always
-   downloads that ENTIRE subtree, including every nested child. Since a
-   stockHistory entry is written on every single distribution AND every
-   stock receipt, embedding it under dealerStock would make dealerStock grow
-   in lockstep with `distributions` (i.e. unbounded, 100K+ eventually) —
-   which would make the admin's one-shot "load all dealers' stock" dashboard
-   read get slower and slower as the system is used, exactly the anti-pattern
-   this whole file otherwise guards against (see the pagination/indexed-query
-   notes throughout). Keeping the two schemas separate — totals always tiny
-   and bulk-loadable, ledger always dealer-scoped and never loaded whole —
-   gets the "each dealer's data lives under its own key" structure that was
-   asked for without reintroducing that regression. */
-const STOCK_TX_TYPES = { STOCK_RECEIVED: 'স্টক যোগ (গ্রহণ)', DISTRIBUTION: 'বিতরণ (বিয়োগ)', STOCK_ADJUSTMENT: 'সমন্বয়' };
-function emptyStockRow() { return { received: 0, distributed: 0, available: 0 }; }
-// Atomically deducts `quantity` from dealerStock/{dealerId}/{fertilizer}.available,
-// never letting it go negative. Returns { committed, previousStock, newStock }.
-//
-// Firebase Realtime Database pitfall this guards against: runTransaction's
-// update function can be invoked with current === null on its very FIRST
-// call whenever this exact node hasn't already been synced to a local
-// listener — not because the server value is null, but simply because the
-// SDK hasn't cached this path yet. The updater below correctly treats null
-// as "0 available" and aborts (returns undefined) when quantity > 0 — which
-// is exactly right if the value really is null, but WRONG the moment it was
-// only "not yet cached". And an aborted transaction is never automatically
-// retried with the real server value the way a normal (non-aborted) one is
-// — the abort is final. That was producing false "স্টক শেষ" failures even
-// when the dealer's real stock was fine (see stock_race_partial in the
-// system log). A get() right before the transaction usually primes the
-// cache enough to avoid this — but rather than trust that alone, an aborted
-// transaction here is double-checked against one fresh, guaranteed-server
-// read before being treated as a genuine shortfall, and retried once if
-// that fresh read shows enough stock after all. Reference:
-// https://firebase.google.com/docs/database/web/read-and-write#save_data_as_transactions
-async function deductDealerStock(dealerId, fertilizer, quantity) {
-  const stockRef = ref(db, `dealerStock/${dealerId}/${fertilizer}`);
-  let previousStock = 0, newStock = 0;
-  const attempt = () => runTransaction(stockRef, (current) => {
-    const cur = current || emptyStockRow();
-    const curAvailable = Number(cur.available) || 0;
-    if (quantity > curAvailable) return; // abort — insufficient at commit time
-    previousStock = curAvailable;
-    newStock = curAvailable - quantity;
-    return { received: Number(cur.received) || 0, distributed: (Number(cur.distributed) || 0) + quantity, available: newStock };
-  });
-  // Diagnostics captured regardless of outcome, so a genuine failure can be
-  // explained instead of just reported — see stockShortfall handling below.
-  const diag = { path: `dealerStock/${dealerId}/${fertilizer}`, quantity, errorCode: null, errorMessage: null };
-  try {
-    await get(stockRef); // prime the local cache — see note above
-    let txResult = await attempt();
-    if (!txResult.committed) {
-      // Don't trust a single abort — confirm against a fresh, guaranteed-
-      // server read (not a possibly-uncached local value) before giving up.
-      const freshSnap = await get(stockRef);
-      const freshVal = freshSnap.exists() ? freshSnap.val() : null;
-      diag.nodeExists = freshSnap.exists();
-      diag.freshAvailable = Number(freshVal && freshVal.available) || 0;
-      diag.freshReceived = Number(freshVal && freshVal.received) || 0;
-      diag.freshDistributed = Number(freshVal && freshVal.distributed) || 0;
-      if (diag.freshAvailable >= quantity) {
-        txResult = await attempt(); // the earlier abort was the caching glitch — retry once
-        if (!txResult.committed) diag.retryAlsoFailed = true;
-      }
-    }
-    return { committed: txResult.committed, previousStock, newStock, diag };
-  } catch (e) {
-    // A genuine exception here (as opposed to committed:false) almost
-    // always means the Realtime Database SECURITY RULES rejected the write
-    // outright — e.code is usually "PERMISSION_DENIED" — which no amount of
-    // client-side retrying can fix; the Rules themselves need to change.
-    // Surfacing e.code/e.message is what tells us which of the two this is.
-    diag.errorCode = (e && e.code) || null;
-    diag.errorMessage = (e && e.message) || String(e);
-    return { committed: false, previousStock, newStock, diag };
-  }
-}
-// Compensating rollback for deductDealerStock — the exact inverse
-// (available += quantity, distributed -= quantity, floored at 0), via its
-// own runTransaction so it stays safe even if the dealer's stock is being
-// touched concurrently (e.g. an admin topping it up at the same instant).
-// Used by handleDistributionSubmit to keep a multi-fertilizer submission
-// all-or-nothing: if item 2 of 3 fails to reserve, or the final atomic
-// distributions/stockHistory/index write is rejected, every reservation
-// already made FOR THIS SUBMISSION is undone rather than left half-applied.
-// Best-effort by design: if the rollback write itself fails (rules/network),
-// silently losing track of the discrepancy would be worse than surfacing
-// it, so it's written to systemLogs for manual correction instead.
-async function restoreDealerStock(dealerId, fertilizer, quantity) {
-  const stockRef = ref(db, `dealerStock/${dealerId}/${fertilizer}`);
-  try {
-    await runTransaction(stockRef, (current) => {
-      const cur = current || emptyStockRow();
-      return {
-        received: Number(cur.received) || 0,
-        distributed: Math.max(0, (Number(cur.distributed) || 0) - quantity),
-        available: (Number(cur.available) || 0) + quantity,
-      };
-    });
-    return true;
-  } catch (e) {
-    writeSystemLog('error', 'stock_rollback_failed', `ডিলার UID: ${dealerId} | সার: ${fertilizer} | পরিমাণ: ${quantity} | এরর: ${(e && e.message) || e}`);
-    return false;
-  }
-}
-
-/* ---------------- farmer land classification (new) ----------------
-   The existing landArea field is stored in শতাংশ (decimal), not বিঘা, so it
-   is converted before classification. 1 বিঘা ≈ 33 শতাংশ — the commonly used
-   approximate conversion in Bangladesh. Centralized here so there is exactly
-   ONE classification function used everywhere (dashboard cards, backfill). */
-const BIGHA_TO_SHOTANGSHO = 33;
-const LAND_CATEGORY_LABELS = { small: 'ছোট কৃষক', medium: 'মাঝারি কৃষক', large: 'বড় কৃষক' };
-function shotangshoToBigha(shotangsho) {
-  const v = parseFloat(shotangsho);
-  if (!v || v <= 0 || isNaN(v)) return 0;
-  return v / BIGHA_TO_SHOTANGSHO;
-}
-function classifyFarmerByLand(landAreaShotangsho) {
-  const bigha = shotangshoToBigha(landAreaShotangsho);
-  if (!bigha || bigha <= 0) return null; // no/invalid land info on record — left uncategorized, never guessed
-  if (bigha <= 5) return 'small';
-  if (bigha < 10) return 'medium';
-  return 'large';
-}
-
-/* ---------------- normalization + mobile/NID/land uniqueness (new) ----------------
-   mobileIndex/{canonicalMobile} = { nid, farmerName }
-   nidIndex/{canonicalNid}       = { mobile, farmerName }
-   khatianDagIndex/{union__khatian__dag} = { nid, farmerName }
-   All three are O(1) indexed lookups (never a full-table scan), checked
-   BEFORE any write — see the validation block inside handleDistributionSubmit.
-   Deliberately separate from the existing farmersIndex/{nid}=true node
-   (kept exactly as-is) so that node's simple boolean contract, used by the
-   farmer-count logic, is never touched by this. */
-function normalizeBanglaDigits(str) {
-  const bn = '০১২৩৪৫৬৭৮৯', en = '0123456789';
-  return String(str === undefined || str === null ? '' : str).replace(/[০-৯]/g, d => en[bn.indexOf(d)]);
-}
-function canonicalMobile(v) {
-  let s = normalizeBanglaDigits(v).replace(/[\s\-]/g, '');
-  s = s.replace(/^\+?88/, ''); // strip Bangladesh country-code prefix so 01XXXXXXXXX and +8801XXXXXXXXX canonicalize the same
-  return s;
-}
-function canonicalNid(v) {
-  return normalizeBanglaDigits(v).replace(/[\s\-]/g, '');
-}
-// Realtime Database keys cannot contain '.', '#', '$', '[', ']', '/'.
-function sanitizeDbKeyPart(s) {
-  return String(s === undefined || s === null ? '' : s).trim().replace(/[.#$\[\]\/]/g, '_');
-}
-function khatianDagKey(union, khatianNumber, dagNumber) {
-  return `${sanitizeDbKeyPart(union)}__${sanitizeDbKeyPart(khatianNumber)}__${sanitizeDbKeyPart(dagNumber)}`;
-}
-
 const LOG_CATEGORIES = {
   all: 'সব', login: 'লগইন', success: 'সফল কার্যক্রম', wrong_login: 'ভুল লগইন',
   error: 'এরর', data_entry: 'ডেটা এন্ট্রি', account: 'অ্যাকাউন্ট', settings: 'সেটিংস', logout: 'লগ আউট',
@@ -584,9 +406,6 @@ const state = {
   duplicates: [],
   systemLogs: [],
   systemLogsError: null,
-  systemLogsLoading: false,
-  duplicatesError: null,
-  duplicatesLoading: false,
   formFieldSettings: { ...DEFAULT_FORM_FIELD_SETTINGS },
   loading: false,
   dbError: null,
@@ -609,26 +428,10 @@ const state = {
   dealerRecentDistributions: [],
   dealerRecentLoading: false,
   dealerTodayCount: 0,
-  // Dealer Stock Dashboard (admin/uno: every dealer's stock, tiny node, safe
-  // to load whole — see the comment near dealerStock above). Dealer role
-  // only ever loads its OWN dealerStock/{uid} subtree (loadMyStock), never
-  // this admin-wide map.
-  dealerStock: {},
-  dealerStockLoading: false,
-  dealerStockError: null,
-  stockSearch: '',
-  // Dealer's own read-only stock view.
-  myStock: null,
-  myStockLoading: false,
-  // Per-dealer stock transaction history — always an indexed query (never
-  // the whole stockHistory node), opened from a modal per dealer.
-  stockHistoryDealerId: null,
-  stockHistoryRows: [],
-  stockHistoryLoading: false,
 };
 /* ---------------- distribution-history pagination state ----------------
    Distribution History (admin/UNO) and Dealer History read directly from
-   Firebase, 20 records/page, using true server-side
+   Firebase, 100 records/page, using true server-side
    query()+limitToFirst/limitToLast pagination — never loading the whole
    70K/100K+ dataset into the browser. Reports and Farmer Search no longer
    depend on state.distributions either (Reports reads the small
@@ -638,13 +441,7 @@ const state = {
 // bound into an inclusive endAt() — kept as a named constant so it's typed
 // out (and escaped) exactly once in this file.
 const FIREBASE_HIGH_KEY = '';
-// Shared by admin/UNO "বিতরণ রেকর্ড" AND dealer's own "বিতরণ ইতিহাস" — both
-// read through the same fetchDistPage/runDistIndexedQuery engine below, so
-// one constant controls both page sizes. CSV export from either page
-// downloads ONLY the currently-visible page's rows (see
-// exportCurrentDistPageCSV) — never an unbounded "every filtered record"
-// download.
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 1000;
 const distPage = {
   rows: [],
   pageNumber: 1,        // 1-based, shown to the user
@@ -658,24 +455,6 @@ const distPage = {
   // number twice — is instant instead of re-querying Firebase.
   rowCache: new Map(),
 };
-/* System Logs and Duplicate-Attempt Log both used to `dbGet()` their ENTIRE
-   node on every admin login/page-open — an unbounded read that only gets
-   more expensive as the system runs (every login, logout, distribution and
-   duplicate attempt adds a row forever). They now fetch only the most
-   recent RECENT_WINDOW entries via orderByKey()+limitToLast() — O(1) cost
-   regardless of table size — and paginate THAT bounded set 20/page
-   client-side (see renderSystemLogs / renderDuplicateLog). Filters (date/
-   category/union/dealer/fertilizer/search) apply within this recent window,
-   not the whole table — a clearly-labelled trade-off, not a silent one. */
-const RECENT_WINDOW = 300;
-const logPage = { pageNumber: 1 };
-const dupPage = { pageNumber: 1 };
-// Dealer dashboard/profile "recent distributions" — state.dealerRecentDistributions
-// is already capped at 50 rows by loadDealerDashboardExtras (a single small,
-// bounded read — not a scalability concern the way systemLogs/duplicateAttempts
-// were). This just paginates that already-loaded ≤50-row list 20/page on
-// screen for readability, with zero extra Firebase reads.
-const dealerRecentPage = { pageNumber: 1 };
 let currentView = 'dashboard';
 let charts = {};
 let inactivityTimer = null;
@@ -798,7 +577,6 @@ function emptyDashboardStats() {
     fertilizer, fertilizerCounts, unions, unionCounts,
     monthly: {}, monthlyCounts: {}, yearly: {}, yearlyCounts: {},
     dealers: {}, dealerStats: {},
-    landCategories: { small: 0, medium: 0, large: 0 },
   };
 }
 function mergeDashboardStats(raw) {
@@ -815,10 +593,6 @@ function mergeDashboardStats(raw) {
     yearlyCounts: { ...((raw && raw.yearlyCounts) || {}) },
     dealers: { ...((raw && raw.dealers) || {}) },
     dealerStats: { ...((raw && raw.dealerStats) || {}) },
-    // Backward-compatible: older dashboardStats snapshots written before this
-    // update simply won't have landCategories yet — default to zeros rather
-    // than crashing, exactly like every other counter here.
-    landCategories: { ...base.landCategories, ...((raw && raw.landCategories) || {}) },
   };
 }
 async function loadDashboardStats() {
@@ -850,17 +624,6 @@ async function rebuildDashboardStatsInBackground() {
       const rows = objToArray(snap.exists() ? snap.val() : null);
       if (!rows.length) break;
       rows.forEach(r => {
-        // Ascending key order ≈ chronological order (Firebase push keys sort
-        // this way), so the FIRST time a NID is seen here is that farmer's
-        // earliest record — exactly matching "classify by the farmer's
-        // registered land amount" (their first-registered land value), and
-        // exactly matching how farmersIndex/totalFarmers already counts each
-        // farmer once. A farmer whose earliest record has no/invalid land
-        // value stays uncategorized rather than being guessed.
-        if (r.nid && !farmers.has(r.nid)) {
-          const cat = classifyFarmerByLand(r.landArea);
-          if (cat) stats.landCategories[cat] = (stats.landCategories[cat] || 0) + 1;
-        }
         if (r.nid) farmers.add(r.nid);
         const qty = parseFloat(r.quantity) || 0;
         stats.totalDistributions++;
@@ -938,7 +701,7 @@ async function updateDashboardStatsForRecord(record) {
    that farmer. farmersIndex/{nid} is a tiny global lookup-only node (never
    scanned in full) that makes "is this a brand-new farmer" an O(1) check
    regardless of how large the distributions table grows. */
-async function updateFarmerCountsForSubmission(nid, dealerId, landArea) {
+async function updateFarmerCountsForSubmission(nid, dealerId) {
   if (!nid) return;
   try {
     const farmerRef = ref(db, `farmersIndex/${nid}`);
@@ -946,12 +709,6 @@ async function updateFarmerCountsForSubmission(nid, dealerId, landArea) {
     if (!alreadyExists) {
       await set(farmerRef, true);
       await runTransaction(ref(db, 'dashboardStats/totalFarmers'), n => (Number(n) || 0) + 1);
-      // Farmer Category Dashboard (ছোট/মাঝারি/বড় কৃষক): classified once per
-      // farmer, from the land value on the very submission that first
-      // registers them — never recomputed later, and never guessed when the
-      // field is left blank (landArea optional per settings).
-      const cat = classifyFarmerByLand(landArea);
-      if (cat) await runTransaction(ref(db, `dashboardStats/landCategories/${cat}`), n => (Number(n) || 0) + 1);
     }
     const dealerFarmerRef = ref(db, `dashboardStats/dealerStats/${dealerId}/farmers/${nid}`);
     const alreadyServedByDealer = (await get(dealerFarmerRef)).exists();
@@ -988,7 +745,7 @@ function applyLocalDashboardStats(records) {
 }
 
 /* =========================================================================
-   DISTRIBUTION HISTORY — true server-side pagination (20 records/page)
+   DISTRIBUTION HISTORY — true server-side pagination (100 records/page)
    =========================================================================
    Firebase Realtime Database only allows ONE orderByChild() and ONE pair of
    range bounds (a single start-type + a single end-type constraint) per
@@ -1012,15 +769,8 @@ function applyLocalDashboardStats(records) {
    table.
 
    Requires these Realtime Database indexes (see rules note below):
-     distributions: .indexOn: ["date","union","dealerId","fertilizer","nid","mobile","farmerName","dealerDateKey"]
+     distributions: .indexOn: ["date","union","dealerId","fertilizer","nid","mobile","farmerName"]
      duplicateAttempts: .indexOn: ["dealerId"]
-   stockHistory does NOT need an .indexOn — it's nested as
-   stockHistory/{dealerId}/{historyId} (see the dealer-stock-management
-   section), so reading one dealer's history is a plain path read, not a
-   query. ("dealerDateKey" is new — see loadDealerDashboardExtras. Paste the
-   updated Rules from Firebase Console → Realtime Database → Rules →
-   Publish, same as any other Rules change in this app — this file cannot
-   deploy Rules itself.)
    ========================================================================= */
 function distIndexField(filters, forDealer) {
   if (forDealer) return { field: 'dealerId', value: filters._dealerUid };
@@ -1228,45 +978,6 @@ async function fetchAllDistributionsForExport(filters, onProgress) {
   all.sort((a, b) => new Date(b.date) - new Date(a.date));
   return all;
 }
-// Full bulk export for the dedicated "ডেটা এক্সপোর্ট" page ONLY — batched
-// query()+limitToFirst reads (never the whole node in one shot), same
-// pattern as fetchAllDistributionsForExport above. The on-page "ডুপ্লিকেট
-// চেষ্টা" list itself never calls this — it only ever downloads its own
-// current (RECENT_WINDOW-bounded) page, see exportDuplicatesCSV.
-async function fetchAllDuplicatesForExport(onProgress) {
-  const base = ref(db, 'duplicateAttempts');
-  const BATCH = 2000;
-  let all = [];
-  let cursorKey = null, more = true, safety = 0;
-  while (more) {
-    const q = cursorKey ? query(base, orderByKey(), startAfter(cursorKey), limitToFirst(BATCH))
-                         : query(base, orderByKey(), limitToFirst(BATCH));
-    const snap = await get(q);
-    const batch = objToArray(snap.exists() ? snap.val() : null);
-    all = all.concat(batch);
-    if (onProgress) onProgress(all.length);
-    if (batch.length < BATCH) { more = false; }
-    else { cursorKey = batch[batch.length - 1].firebaseKey; }
-    if (++safety > 500) break; // hard safety cap — covers up to ~1M rows
-  }
-  all.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  return all;
-}
-async function exportAllDuplicatesCSV() {
-  const btn = document.querySelector('[data-action="export-duplicates-full"]');
-  const origText = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = 'এক্সপোর্ট হচ্ছে... (0)'; }
-  try {
-    const all = await fetchAllDuplicatesForExport((count) => { if (btn) btn.textContent = `এক্সপোর্ট হচ্ছে... (${count})`; });
-    const rows = all.map((r, i) => [i + 1, r.farmerName, csvTextGuard(r.nid), fertilizerLabel(r.fertilizer), csvDate(r.date), csvDate(r.existingDate), r.dealerName, r.union]);
-    downloadCSV('duplicate_attempts_all.csv', toCSV(['#', 'কৃষক', 'এনআইডি', 'সার', 'চেষ্টার তারিখ', 'পূর্বের তারিখ', 'ডিলার', 'ইউনিয়ন'], rows));
-    showToast(`${all.length} টি এন্ট্রি এক্সপোর্ট সম্পন্ন হয়েছে`, 'success');
-  } catch (e) {
-    showToast('এক্সপোর্ট ব্যর্থ হয়েছে: ' + ((e && e.message) || ''), 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = origText; }
-  }
-}
 /* Every log entry is a "create-only, self-authored" write — any signed-in
    user may write a log row about their OWN action (uid must match
    auth.currentUser.uid per the Security Rules), but only the Main Admin can
@@ -1325,15 +1036,9 @@ function randomPassword(len) {
 async function loadSystemLogsOnly() {
   if (state.user.role !== 'admin') return;
   state.systemLogsError = null;
-  state.systemLogsLoading = true;
-  renderCurrentView();
   try {
-    // Bounded read: only the RECENT_WINDOW most recent entries, by key
-    // (Firebase push keys sort chronologically) — never the whole node,
-    // no matter how many logs have accumulated over the system's lifetime.
-    const snap = await get(query(ref(db, 'systemLogs'), orderByKey(), limitToLast(RECENT_WINDOW)));
-    state.systemLogs = objToArray(snap.exists() ? snap.val() : null).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    logPage.pageNumber = 1;
+    const logsObj = await dbGet('systemLogs');
+    state.systemLogs = objToArray(logsObj).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
   } catch (e) {
     // Most common cause: the Realtime Database Security Rules on the live
     // Firebase project don't yet include the "systemLogs" node rule (it has
@@ -1343,7 +1048,6 @@ async function loadSystemLogsOnly() {
     state.systemLogsError = (e && e.message) || 'সিস্টেম লগ লোড করা যায়নি';
     state.systemLogs = [];
   }
-  state.systemLogsLoading = false;
   renderCurrentView();
 }
 async function loadFormFieldsOnly() {
@@ -1354,22 +1058,11 @@ async function loadFormFieldsOnly() {
   } catch (e) { /* Optional configuration must not block the shell. */ }
 }
 async function loadDuplicatesOnly() {
-  if (state.user.role !== 'admin' && state.user.role !== 'uno') return;
-  state.duplicatesError = null;
-  state.duplicatesLoading = true;
-  renderCurrentView();
   try {
-    // Same bounded-window approach as loadSystemLogsOnly — RECENT_WINDOW
-    // most recent attempts by key, never the whole duplicateAttempts node.
-    const snap = await get(query(ref(db, 'duplicateAttempts'), orderByKey(), limitToLast(RECENT_WINDOW)));
-    state.duplicates = objToArray(snap.exists() ? snap.val() : null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    dupPage.pageNumber = 1;
-  } catch (e) {
-    state.duplicatesError = (e && e.message) || 'ডুপ্লিকেট চেষ্টার তথ্য লোড করা যায়নি';
-    state.duplicates = [];
-  }
-  state.duplicatesLoading = false;
-  renderCurrentView();
+    const dupObj = await dbGet('duplicateAttempts');
+    state.duplicates = objToArray(dupObj).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    renderCurrentView();
+  } catch (e) { state.duplicates = []; }
 }
 async function loadAllData() {
   state.loading = true; state.dbError = null; renderCurrentView();
@@ -1385,9 +1078,7 @@ async function loadAllData() {
       state.systemLogs = [];
       if (state.user.role === 'admin') {
         dbGet('uno').then(unoObj => { state.unos = objToArray(unoObj); }).catch(() => { state.unos = []; });
-        // System Logs and Duplicate Log are no longer preloaded on every
-        // admin login — they now load lazily, bounded, only when their own
-        // page is opened (see navigateTo, loadSystemLogsOnly, loadDuplicatesOnly).
+        setTimeout(() => loadSystemLogsOnly(), 0);
       }
     } else {
       await loadDashboardStats();
@@ -1515,10 +1206,8 @@ const ADMIN_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'addDealer', label: 'ডিলার যুক্ত করুন', icon: 'addDealer' },
   { id: 'dealerList', label: 'ডিলার তালিকা', icon: 'dealers' },
-  { id: 'dealerStock', label: 'ডিলার স্টক ব্যবস্থাপনা', icon: 'bag' },
   { id: 'unoManagement', label: 'UNO ব্যবস্থাপনা', icon: 'uno' },
   { id: 'distributions', label: 'বিতরণ রেকর্ড', icon: 'distribute' },
-  { id: 'duplicates', label: 'ডুপ্লিকেট চেষ্টা', icon: 'duplicate' },
   { id: 'farmerSearch', label: 'কৃষক অনুসন্ধান', icon: 'search' },
   { id: 'reports', label: 'রিপোর্ট', icon: 'reports' },
   { id: 'exportData', label: 'ডেটা এক্সপোর্ট', icon: 'export' },
@@ -1526,15 +1215,13 @@ const ADMIN_NAV = [
   { id: 'settings', label: 'সেটিংস', icon: 'settings' },
 ];
 // UNO has the exact same DATA ACCESS as Main Admin (dealers, distributions,
-// reports, export, farmer search, dealer stock) but none of Main Admin's
-// exclusive system-management pages (dealer/UNO account management, form
-// field configuration, or the system log itself).
+// reports, export, farmer search) but none of Main Admin's exclusive
+// system-management pages (dealer/UNO account management, form field
+// configuration, or the system log itself).
 const UNO_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'dealerList', label: 'ডিলার তালিকা', icon: 'dealers' },
-  { id: 'dealerStock', label: 'ডিলার স্টক ব্যবস্থাপনা', icon: 'bag' },
   { id: 'distributions', label: 'বিতরণ রেকর্ড', icon: 'distribute' },
-  { id: 'duplicates', label: 'ডুপ্লিকেট চেষ্টা', icon: 'duplicate' },
   { id: 'farmerSearch', label: 'কৃষক অনুসন্ধান', icon: 'search' },
   { id: 'reports', label: 'রিপোর্ট', icon: 'reports' },
   { id: 'exportData', label: 'ডেটা এক্সপোর্ট', icon: 'export' },
@@ -1543,7 +1230,6 @@ const DEALER_NAV = [
   { id: 'dashboard', label: 'ড্যাশবোর্ড', icon: 'dashboard' },
   { id: 'distribute', label: 'সার বিতরণ করুন', icon: 'distribute' },
   { id: 'history', label: 'বিতরণ ইতিহাস', icon: 'history' },
-  { id: 'myStock', label: 'আমার স্টক', icon: 'bag' },
   { id: 'farmerSearch', label: 'কৃষক অনুসন্ধান', icon: 'search' },
   { id: 'profile', label: 'প্রোফাইল', icon: 'profile' },
 ];
@@ -1573,25 +1259,10 @@ function navigateTo(view) {
   state.farmerSearchResults = null;
   renderSidebar();
   if (view === 'distributions' || view === 'history') {
-    resetAndLoadDistPage(); // server-side paginated fetch (PAGE_SIZE/page), independent of state.distributions
-  } else if ((view === 'dashboard' || view === 'profile') && state.user.role === 'dealer') {
-    // 'profile' now also shows the dealer's own last-50-records preview
-    // (see renderDealerProfile), so it needs the same small indexed load as
-    // 'dashboard' — never the whole distributions table.
+    resetAndLoadDistPage(); // server-side paginated fetch (100/page), independent of state.distributions
+  } else if (view === 'dashboard' && state.user.role === 'dealer') {
     renderCurrentView();
     loadDealerDashboardExtras();
-  } else if (view === 'dealerStock' && (state.user.role === 'admin' || state.user.role === 'uno')) {
-    renderCurrentView();
-    loadDealerStockData();
-  } else if (view === 'myStock' && state.user.role === 'dealer') {
-    renderCurrentView();
-    loadMyStock();
-  } else if (view === 'systemLogs' && state.user.role === 'admin') {
-    renderCurrentView();
-    loadSystemLogsOnly();
-  } else if (view === 'duplicates' && (state.user.role === 'admin' || state.user.role === 'uno')) {
-    renderCurrentView();
-    loadDuplicatesOnly();
   } else {
     // 'reports' reads straight from the already-loaded dashboardStats
     // aggregate (see renderReports) and 'farmerSearch' only runs a query
@@ -1626,10 +1297,8 @@ function renderCurrentView() {
       case 'dashboard': html = renderAdminDashboard(); break;
       case 'addDealer': html = renderAddDealerForm(); break;
       case 'dealerList': html = renderDealerList(); break;
-      case 'dealerStock': html = renderDealerStockDashboard(); break;
       case 'unoManagement': html = renderUnoManagement(); break;
       case 'distributions': html = renderDistributionRecords(); break;
-      case 'duplicates': html = renderDuplicateLog(); break;
       case 'farmerSearch': html = renderFarmerSearch(); break;
       case 'reports': html = renderReports(); break;
       case 'exportData': html = renderExportData(); break;
@@ -1645,9 +1314,7 @@ function renderCurrentView() {
     switch (currentView) {
       case 'dashboard': html = renderAdminDashboard(); break;
       case 'dealerList': html = renderDealerList(); break;
-      case 'dealerStock': html = renderDealerStockDashboard(); break;
       case 'distributions': html = renderDistributionRecords(); break;
-      case 'duplicates': html = renderDuplicateLog(); break;
       case 'farmerSearch': html = renderFarmerSearch(); break;
       case 'reports': html = renderReports(); break;
       case 'exportData': html = renderExportData(); break;
@@ -1658,7 +1325,6 @@ function renderCurrentView() {
       case 'dashboard': html = renderDealerDashboard(); break;
       case 'distribute': html = renderDistributionForm(); break;
       case 'history': html = renderDealerHistory(); break;
-      case 'myStock': html = renderMyStockDashboard(); break;
       case 'farmerSearch': html = renderFarmerSearch(); break;
       case 'profile': html = renderDealerProfile(); break;
       default: html = renderDealerDashboard();
@@ -1681,7 +1347,6 @@ function renderAdminDashboard() {
   const totalDistributions = stats.totalDistributions;
   const duplicateAttempts = stats.duplicateAttempts;
   const totalFertilizer = stats.totalFertilizer;
-  const lc = stats.landCategories || { small: 0, medium: 0, large: 0 };
   return `
     <div class="page-header"><h2>ড্যাশবোর্ড</h2><span class="muted">সিস্টেমের সার্বিক অবস্থা</span></div>
     <div class="stat-grid">
@@ -1690,12 +1355,6 @@ function renderAdminDashboard() {
       ${statCard('মোট বিতরণ', totalDistributions, 'distribute')}
       ${statCard('ডুপ্লিকেট চেষ্টা', duplicateAttempts, 'duplicate', 'danger')}
       ${statCard('মোট সার বিতরণ (কেজি)', totalFertilizer.toLocaleString('bn-BD'), 'bag', 'gold')}
-    </div>
-    <div class="page-header" style="margin-bottom:10px;"><h3 style="font-size:15px;">কৃষক শ্রেণী (জমির পরিমাণ অনুযায়ী)</h3></div>
-    <div class="stat-grid">
-      ${statCard(LAND_CATEGORY_LABELS.small, lc.small || 0, 'profile')}
-      ${statCard(LAND_CATEGORY_LABELS.medium, lc.medium || 0, 'profile', 'gold')}
-      ${statCard(LAND_CATEGORY_LABELS.large, lc.large || 0, 'profile', 'danger')}
     </div>
     <div class="chart-grid">
       <div class="glass-card chart-card"><h3>সার ভিত্তিক বিতরণ</h3><div class="chart-canvas-wrap"><canvas id="chartFertilizer"></canvas></div></div>
@@ -2280,8 +1939,8 @@ async function handleDistributionSubmit(form) {
   const landArea = landAreaRaw ? parseFloat(landAreaRaw) : null;
   const data = {
     farmerName: form.farmerName.value.trim(),
-    nid: normalizeBanglaDigits(form.nid.value).trim(),
-    mobile: normalizeBanglaDigits(form.mobile.value).trim(),
+    nid: form.nid.value.trim(),
+    mobile: form.mobile.value.trim(),
     union: form.union.value,
     village: form.village.value.trim(),
     landArea: landArea,
@@ -2305,45 +1964,6 @@ async function handleDistributionSubmit(form) {
   if (isFieldRequired('cropName') && !cropNames.length) { showToast('ফসলের নাম নির্বাচন করুন', 'error'); return; }
   if (cropSelections.includes(CROP_CUSTOM_VALUE) && !cropCustom) { showToast('ফসলের নাম লিখে দিন', 'error'); return; }
   if (new Date(data.date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
-
-  // ---- Mobile ↔ NID uniqueness + খতিয়ান/দাগ land-duplicate validation ----
-  // Runs BEFORE anything is written (Input → Normalize → Search existing
-  // index → Validate → Save), each an O(1) indexed-node lookup — never a
-  // scan of the distributions table. See mobileIndex/nidIndex/
-  // khatianDagIndex + the normalization helpers defined near FORM_FIELD_CONFIG.
-  const cMobile = canonicalMobile(data.mobile);
-  const cNid = canonicalNid(data.nid);
-  try {
-    const [mobileEntry, nidEntry] = await Promise.all([
-      dbGet(`mobileIndex/${cMobile}`),
-      dbGet(`nidIndex/${cNid}`),
-    ]);
-    if (mobileEntry && mobileEntry.nid && mobileEntry.nid !== cNid) {
-      showToast('এই মোবাইল নম্বরটি ইতোমধ্যে অন্য একটি NID নম্বরের সাথে নিবন্ধিত আছে।', 'error');
-      return;
-    }
-    if (nidEntry && nidEntry.mobile && nidEntry.mobile !== cMobile) {
-      showToast('এই NID নম্বরের সাথে অন্য একটি মোবাইল নম্বর নিবন্ধিত আছে।', 'error');
-      return;
-    }
-  } catch (e) {
-    showToast('মোবাইল/এনআইডি যাচাই করা যায়নি — নেটওয়ার্ক বা Firebase Rules/Index চেক করুন', 'error');
-    return;
-  }
-  let landKeyForThisSubmit = null;
-  if (data.dagNumber && data.khatianNumber) {
-    landKeyForThisSubmit = khatianDagKey(data.union, data.khatianNumber, data.dagNumber);
-    try {
-      const landEntry = await dbGet(`khatianDagIndex/${landKeyForThisSubmit}`);
-      if (landEntry && landEntry.nid && landEntry.nid !== cNid) {
-        showToast('এই খতিয়ান ও দাগ নম্বর ইতোমধ্যে অন্য কৃষকের নামে নিবন্ধিত আছে।', 'error');
-        return;
-      }
-    } catch (e) {
-      showToast('জমির তথ্য যাচাই করা যায়নি — নেটওয়ার্ক বা Firebase Rules/Index চেক করুন', 'error');
-      return;
-    }
-  }
 
   // Collect every fertilizer row the dealer added (one farmer visit can now
   // include several different fertilizers in a single submission).
@@ -2389,26 +2009,6 @@ async function handleDistributionSubmit(form) {
     return;
   }
 
-  // ---- Dealer stock availability pre-check (block BEFORE any write) ----
-  // Every dealer distribution now draws down that dealer's own fertilizer
-  // stock (সেটিংস → "ডিলার স্টক ব্যবস্থাপনা"). A dealer with no stock record
-  // yet for a fertilizer simply has 0 available — never a silent unlimited
-  // supply. One indexed read per fertilizer row; never a table scan.
-  const dealerId = state.user.uid;
-  try {
-    const stockChecks = await Promise.all(items.map(it => dbGet(`dealerStock/${dealerId}/${it.fertilizer}/available`)));
-    for (let i = 0; i < items.length; i++) {
-      const available = Number(stockChecks[i]) || 0;
-      if (items[i].quantity > available) {
-        showToast(`${fertilizerLabel(items[i].fertilizer)} — পর্যাপ্ত সার মজুদ নেই। বর্তমান স্টক: ${available.toLocaleString('bn-BD')} KG`, 'error');
-        return;
-      }
-    }
-  } catch (e) {
-    showToast('স্টক তথ্য যাচাই করা যায়নি — নেটওয়ার্ক বা Firebase Rules/Index চেক করুন', 'error');
-    return;
-  }
-
   isSubmitting = true;
   const btn = document.getElementById('distSubmitBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
@@ -2417,146 +2017,37 @@ async function handleDistributionSubmit(form) {
     // report, chart, CSV export and duplicate check — all built around
     // "one record = one fertilizer" — keeps working unchanged); a shared
     // batchId just ties same-visit records together for future reference.
-    //
-    // ALL-OR-NOTHING SUBMISSION. The previous implementation deducted stock
-    // and pushed each fertilizer's distribution record one at a time inside
-    // the same loop, and simply `break`-ed on the first stock failure — which
-    // meant a 3-fertilizer visit where item #2 ran out of stock left item #1
-    // permanently saved (and its stock permanently deducted) while #2/#3
-    // silently never happened. That is a real data-integrity problem for a
-    // production system: the dealer sees a partial, confusing result and the
-    // stock ledger and distribution table can drift apart. This is now a
-    // strict two-phase commit instead:
-    //   Phase 1 — reserve stock for EVERY item first (each reservation still
-    //             its own runTransaction, so concurrent submissions racing
-    //             for the same dealer+fertilizer stock stay safe). If ANY
-    //             item can't be reserved, every reservation already made for
-    //             THIS submission is compensated (restoreDealerStock) and the
-    //             whole submission aborts — nothing is written.
-    //   Phase 2 — once every item has reserved stock, write every
-    //             distribution record + its stockHistory ledger entry + the
-    //             mobile/NID/land identity indexes as ONE atomic
-    //             multi-location update(ref(db), {...}) call. Firebase commits
-    //             a multi-path update() as a single unit — either every path
-    //             lands or none do — so there is no window where some of this
-    //             visit's fertilizer records exist and others don't. If this
-    //             write is rejected (Rules/network), Phase 1's reservations
-    //             are rolled back the same way.
-    // Dashboard-stat increments (Phase 3) only run AFTER Phase 2 has actually
-    // committed, and are intentionally best-effort/eventually-consistent —
-    // সেটিংস → "এখনই পুনঃগণনা করুন" can always correct drift there — unlike
-    // Phases 1–2 which must never be left half-applied.
     const batchId = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     const createdAt = Date.now();
-
-    // ---- Phase 1: reserve stock for every item, all-or-nothing ----
-    const reserved = []; // [{ item, previousStock, newStock }]
-    let stockShortfall = null, stockShortfallDiag = null;
-    for (const it of items) {
-      const { committed, previousStock, newStock, diag } = await deductDealerStock(dealerId, it.fertilizer, it.quantity);
-      if (!committed) { stockShortfall = it; stockShortfallDiag = diag; break; }
-      reserved.push({ item: it, previousStock, newStock });
-    }
-    if (stockShortfall) {
-      // Undo every reservation already made for this submission before
-      // reporting failure — the dealer's stock must reflect reality again,
-      // exactly as if this submission never started.
-      await Promise.all(reserved.map(r => restoreDealerStock(dealerId, r.item.fertilizer, r.item.quantity)));
-      showToast(`"${fertilizerLabel(stockShortfall.fertilizer)}"-এর স্টক ঠিক এই মুহূর্তে শেষ হয়ে গেছে — কিছুই সংরক্ষণ হয়নি। আবার চেষ্টা করুন।`, 'error');
-      // Rich diagnostics so this is debuggable from সিস্টেম লগ alone, without
-      // needing Firebase Console access: whether the stock node existed at
-      // all, the actual fresh available/received/distributed at the moment
-      // of failure, whether the automatic retry also failed, and — if the
-      // failure was a thrown exception rather than a plain "insufficient"
-      // abort — the exact error code (PERMISSION_DENIED almost always means
-      // the Security Rules rejected it, which no client-side retry can fix).
-      const d = stockShortfallDiag || {};
-      const diagMsg = d.errorCode
-        ? `এরর কোড: ${d.errorCode} — ${d.errorMessage || ''}`
-        : `নোড আছে কিনা: ${d.nodeExists ? 'হ্যাঁ' : 'না'} | প্রকৃত available: ${d.freshAvailable ?? '?'} | চাহিদা: ${d.quantity ?? '?'} | received: ${d.freshReceived ?? '?'} | distributed: ${d.freshDistributed ?? '?'}${d.retryAlsoFailed ? ' | রিট্রাই-ও ব্যর্থ হয়েছে' : ''}`;
-      writeSystemLog('data_entry', 'stock_race_aborted', `কৃষক: ${data.farmerName} | ডিলার UID: ${dealerId} | ব্যর্থ: ${stockShortfall.fertilizer} | ${diagMsg} | পুরো সাবমিশন বাতিল, কোনো রেকর্ড সংরক্ষণ হয়নি`);
-      if (btn) { btn.disabled = false; btn.textContent = 'সংরক্ষণ করুন'; }
-      return;
-    }
-
-    // ---- Phase 2: one atomic multi-location write ----
-    // Record/history keys are pre-generated with push(...).key (no data
-    // written yet) purely to get unique IDs to address inside the single
-    // update object below — dbPush is NOT used here because each call to it
-    // would be its own separate write.
     const newRecords = [];
-    const multiUpdate = {};
     for (const it of items) {
-      const recId = push(ref(db, 'distributions')).key;
-      // stockHistory is nested under this dealer's own key
-      // (stockHistory/{dealerId}/{historyId}) — see the dealer-stock-
-      // management schema note near deductDealerStock for why this stays a
-      // separate node from dealerStock rather than being embedded in it.
-      const histId = push(ref(db, `stockHistory/${dealerId}`)).key;
-      const reservation = reserved.find(r => r.item === it);
-      // dealerDateKey is a synthetic composite index field (dealerId_date)
-      // purely so "how many did THIS dealer distribute TODAY" can be an
-      // exact O(matching rows) indexed query instead of an approximation
-      // derived from a capped preview — see loadDealerDashboardExtras.
-      const record = { ...data, fertilizer: it.fertilizer, quantity: it.quantity, dealerId, dealerName: state.user.name, batchId, createdAt, dealerDateKey: `${dealerId}_${data.date}` };
-      multiUpdate[`distributions/${recId}`] = record;
-      multiUpdate[`stockHistory/${dealerId}/${histId}`] = {
-        dealerId, dealerName: state.user.name, fertilizer: it.fertilizer,
-        transactionType: 'DISTRIBUTION', quantity: it.quantity,
-        previousStock: reservation.previousStock, newStock: reservation.newStock,
-        addedBy: state.user.uid, addedByName: state.user.name,
-        note: `বিতরণ — কৃষক: ${data.farmerName}`, date: data.date, createdAt,
-      };
-      newRecords.push({ id: recId, ...record });
+      const record = { ...data, fertilizer: it.fertilizer, quantity: it.quantity, dealerId: state.user.uid, dealerName: state.user.name, batchId, createdAt };
+      const res = await dbPush('distributions', record);
+      newRecords.push({ id: res.name, ...record });
     }
-    // Farmer identity mapping — already validated above for this submission —
-    // rides in the SAME atomic write so it can never land while the records
-    // it's supposed to correspond to don't (or vice versa).
-    multiUpdate[`mobileIndex/${cMobile}`] = { nid: cNid, farmerName: data.farmerName };
-    multiUpdate[`nidIndex/${cNid}`] = { mobile: cMobile, farmerName: data.farmerName };
-    if (landKeyForThisSubmit) multiUpdate[`khatianDagIndex/${landKeyForThisSubmit}`] = { nid: cNid, farmerName: data.farmerName };
-
-    try {
-      await update(ref(db), multiUpdate);
-    } catch (e) {
-      // The entire multi-location write was rejected (Rules/network/etc) —
-      // per Firebase's multi-path update() semantics NONE of it was
-      // persisted, so this is a clean abort: roll back Phase 1's stock
-      // reservations and stop. No partial distribution records exist.
-      await Promise.all(reserved.map(r => restoreDealerStock(dealerId, r.item.fertilizer, r.item.quantity)));
-      showToast('সংরক্ষণ করা যায়নি, নেটওয়ার্ক বা Firebase Rules চেক করুন — কিছুই সংরক্ষণ/পরিবর্তন হয়নি', 'error');
-      writeSystemLog('error', 'distribution_create_failed', (e && e.message) || 'unknown');
-      if (btn) { btn.disabled = false; btn.textContent = 'সংরক্ষণ করুন'; }
-      return;
-    }
-
-    // ---- Phase 3: best-effort dashboard-stat increments (only after Phase
-    // 2 has actually committed). Instant local feedback first (see
-    // applyLocalDashboardStats), then persist every counter atomically so
-    // "click count" / farmer count are correct for EVERY dealer's submission
-    // — not just the admin's — and visible on reload without ever
-    // re-scanning the whole table.
+    // Instant local feedback first (see applyLocalDashboardStats), then
+    // persist every counter atomically so "click count" / farmer count are
+    // correct for EVERY dealer's submission — not just the admin's — and
+    // visible on reload without ever re-scanning the whole table.
     applyLocalDashboardStats(newRecords);
     if (state.user.role === 'dealer') {
-      state.dealerRecentDistributions = [...newRecords.slice().reverse(), ...(state.dealerRecentDistributions || [])].slice(0, 50);
+      state.dealerRecentDistributions = [...newRecords.slice().reverse(), ...(state.dealerRecentDistributions || [])].slice(0, 6);
       const today = todayStr();
       state.dealerTodayCount = (state.dealerTodayCount || 0) + newRecords.filter(r => r.date === today).length;
     }
     renderCurrentView();
     await Promise.all(newRecords.map(record => updateDashboardStatsForRecord(record)));
-    await updateFarmerCountsForSubmission(data.nid, dealerId, data.landArea);
+    await updateFarmerCountsForSubmission(data.nid, state.user.uid);
     try {
       const freshTotalFarmers = await dbGet('dashboardStats/totalFarmers');
       if (state.dashboardStats && freshTotalFarmers !== null) state.dashboardStats.totalFarmers = freshTotalFarmers;
     } catch (e) { /* non-critical — next full load will pick up the true value anyway */ }
     await refreshDashboardSnapshot();
-
     showToast(`সফলভাবে সংরক্ষণ করা হয়েছে (${items.length} টি সার)`, 'success');
-    writeSystemLog('data_entry', 'distribution_created', `কৃষক: ${data.farmerName} | ${newRecords.length} টি সার (${newRecords.map(i => i.fertilizer).join(', ')})`);
+    writeSystemLog('data_entry', 'distribution_created', `কৃষক: ${data.farmerName} | ${items.length} টি সার (${items.map(i => i.fertilizer).join(', ')})`);
   } catch (e) {
     showToast('সংরক্ষণ করা যায়নি, নেটওয়ার্ক বা Firebase Rules চেক করুন', 'error');
     writeSystemLog('error', 'distribution_create_failed', (e && e.message) || 'unknown');
-    if (btn) { btn.disabled = false; btn.textContent = 'সংরক্ষণ করুন'; }
   } finally {
     isSubmitting = false;
   }
@@ -2575,25 +2066,16 @@ async function loadDealerDashboardExtras() {
   state.dealerRecentLoading = true;
   renderCurrentView();
   try {
-    const today = todayStr();
-    // Dealer panel performance requirement: load ONLY the latest 50 records
-    // relevant to this dealer — never the whole distributions table, and
-    // never any other dealer's/union's data. "Today's count" is a SEPARATE
-    // exact indexed lookup (dealerDateKey = `${dealerId}_${date}`, set on
-    // every new record — see handleDistributionSubmit) rather than being
-    // derived from the capped 50-row preview, so a busy day with more than
-    // 50 distributions still shows the true today count.
-    const [distSnap, todaySnap, dupSnap] = await Promise.all([
-      get(query(ref(db, 'distributions'), orderByChild('dealerId'), equalTo(dealerId), limitToLast(50))),
-      get(query(ref(db, 'distributions'), orderByChild('dealerDateKey'), equalTo(`${dealerId}_${today}`))),
+    const [distSnap, dupSnap] = await Promise.all([
+      get(query(ref(db, 'distributions'), orderByChild('dealerId'), equalTo(dealerId), limitToLast(200))),
       get(query(ref(db, 'duplicateAttempts'), orderByChild('dealerId'), equalTo(dealerId))),
     ]);
     const rows = objToArray(distSnap.exists() ? distSnap.val() : null)
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    state.dealerRecentDistributions = rows.slice(0, 50);
-    state.dealerTodayCount = todaySnap.exists() ? Object.keys(todaySnap.val()).length : 0;
+    state.dealerRecentDistributions = rows.slice(0, 6);
+    const today = todayStr();
+    state.dealerTodayCount = rows.filter(r => r.date === today).length;
     state.duplicates = objToArray(dupSnap.exists() ? dupSnap.val() : null);
-    dealerRecentPage.pageNumber = 1;
   } catch (e) {
     state.dealerRecentDistributions = []; state.dealerTodayCount = 0;
   }
@@ -2617,28 +2099,7 @@ function renderDealerDashboard() {
     </div>
     <div class="glass-card">
       <div class="row-between"><h3>সাম্প্রতিক বিতরণ</h3><button class="btn btn-primary btn-sm" data-action="navigate" data-view="distribute">+ নতুন বিতরণ</button></div>
-      ${state.dealerRecentLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : recent.length ? (() => {
-        if (dealerRecentPage.pageNumber > Math.max(1, Math.ceil(recent.length / PAGE_SIZE))) dealerRecentPage.pageNumber = Math.max(1, Math.ceil(recent.length / PAGE_SIZE));
-        const pageRows = recent.slice((dealerRecentPage.pageNumber - 1) * PAGE_SIZE, dealerRecentPage.pageNumber * PAGE_SIZE);
-        return `<div class="table-wrap"><table class="data-table"><thead><tr><th>কৃষক</th><th>সার</th><th>পরিমাণ</th><th>তারিখ</th></tr></thead><tbody>${pageRows.map(r => `<tr><td>${esc(r.farmerName)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table></div>${renderWindowPaginationBar(dealerRecentPage, recent.length, 'dealer-recent-prev-page', 'dealer-recent-next-page')}`;
-      })() : emptyState('এখনো কোনো বিতরণ রেকর্ড নেই।')}
-    </div>
-  `;
-}
-// Simple client-side pager over an already-loaded, BOUNDED window (see
-// RECENT_WINDOW) — used by System Logs and the Duplicate Attempt Log. Both
-// pages fetch at most RECENT_WINDOW rows total from Firebase (never the
-// whole node) and then slice PAGE_SIZE at a time here for display, so
-// re-paging never triggers another network read.
-function renderWindowPaginationBar(pageState, filteredLength, prevAction, nextAction) {
-  const totalPages = Math.max(1, Math.ceil(filteredLength / PAGE_SIZE));
-  return `
-    <div class="row-between" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
-      <div class="muted">মোট ${filteredLength} টি এন্ট্রি (প্রতি পেজে ${PAGE_SIZE} টি) — পেজ ${pageState.pageNumber} / ${totalPages}</div>
-      <div style="display:flex;gap:6px;">
-        <button class="btn btn-outline btn-sm" data-action="${prevAction}" ${pageState.pageNumber <= 1 ? 'disabled' : ''}>← আগের পেজ</button>
-        <button class="btn btn-outline btn-sm" data-action="${nextAction}" ${pageState.pageNumber >= totalPages ? 'disabled' : ''}>পরের পেজ →</button>
-      </div>
+      ${state.dealerRecentLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : recent.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>কৃষক</th><th>সার</th><th>পরিমাণ</th><th>তারিখ</th></tr></thead><tbody>${recent.map(r => `<tr><td>${esc(r.farmerName)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('এখনো কোনো বিতরণ রেকর্ড নেই।')}
     </div>
   `;
 }
@@ -2714,7 +2175,7 @@ async function goToDistPage(targetPage) {
 function renderDealerHistory() {
   const rows = distPage.rows;
   return `
-    <div class="page-header"><h2>বিতরণ ইতিহাস</h2><button class="btn btn-outline btn-sm" data-action="export-current-page">${ic('export', 'icon-sm')} CSV ডাউনলোড (এই পেজ)</button></div>
+    <div class="page-header"><h2>বিতরণ ইতিহাস</h2></div>
     ${renderFilterBar({ showDealer: false, showUnion: false })}
     <div class="glass-card" style="margin-bottom:12px;"><span class="muted">আপনার এলাকা: <b>${esc(state.user.union)}</b> — শুধুমাত্র আপনার নিজের বিতরণের রেকর্ড এখানে দেখা যাবে।</span></div>
     <div class="glass-card table-wrap">
@@ -2724,10 +2185,6 @@ function renderDealerHistory() {
   `;
 }
 function renderDealerProfile() {
-  const dealerStats = (state.dashboardStats && state.dashboardStats.dealerStats && state.dashboardStats.dealerStats[state.user.id]) || {};
-  const totalFertilizer = dealerStats.totalFertilizer || 0;
-  const totalDistributions = dealerStats.totalDistributions || 0;
-  const recent = state.dealerRecentDistributions || [];
   return `
     <div class="page-header"><h2>প্রোফাইল</h2></div>
     <div class="glass-card" style="max-width:480px;margin-bottom:16px;">
@@ -2738,18 +2195,6 @@ function renderDealerProfile() {
         <div><b>ইউনিয়ন:</b> ${esc(state.user.union)}</div>
         <div><b>এলাকার ডিলার:</b> ${esc(state.user.area || '-')}</div>
       </div>
-    </div>
-    <div class="stat-grid">
-      ${statCard('সর্বমোট বিতরণ', totalDistributions, 'history')}
-      ${statCard('সর্বমোট সার বিতরণ (কেজি)', totalFertilizer.toLocaleString('bn-BD'), 'bag', 'gold')}
-    </div>
-    <div class="glass-card" style="margin-bottom:16px;">
-      <div class="row-between" style="margin-bottom:10px;"><h3>সর্বশেষ ৫০টি বিতরণ রেকর্ড</h3><button class="btn btn-outline btn-sm" data-action="export-my-recent">${ic('export', 'icon-sm')} CSV ডাউনলোড (সর্বমোট)</button></div>
-      ${state.dealerRecentLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : recent.length ? (() => {
-        if (dealerRecentPage.pageNumber > Math.max(1, Math.ceil(recent.length / PAGE_SIZE))) dealerRecentPage.pageNumber = Math.max(1, Math.ceil(recent.length / PAGE_SIZE));
-        const pageRows = recent.slice((dealerRecentPage.pageNumber - 1) * PAGE_SIZE, dealerRecentPage.pageNumber * PAGE_SIZE);
-        return `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>সার</th><th>পরিমাণ</th><th>তারিখ</th></tr></thead><tbody>${pageRows.map((r, i) => `<tr><td>${(dealerRecentPage.pageNumber - 1) * PAGE_SIZE + i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table></div>${renderWindowPaginationBar(dealerRecentPage, recent.length, 'dealer-recent-prev-page', 'dealer-recent-next-page')}`;
-      })() : emptyState('এখনো কোনো বিতরণ রেকর্ড নেই।')}
     </div>
     <div class="glass-card" style="max-width:480px;">
       <h3>পাসওয়ার্ড পরিবর্তন করুন</h3>
@@ -2776,231 +2221,6 @@ async function handleChangePasswordSubmit(form) {
     form.reset();
   } catch (e) {
     showToast(mapAuthError(e), 'error');
-  }
-}
-
-/* ---------------- dealer stock management — data + views (new) ----------------
-   dealerStock stays tiny regardless of how large `distributions` grows
-   (bounded by dealer-count × fertilizer-count), so admin/uno load it in
-   full exactly like `dealers` already is. A dealer only ever loads its own
-   dealerStock/{uid} subtree — never any other dealer's. stockHistory can
-   genuinely grow large over time, so it is ALWAYS a per-dealer read
-   (stockHistory/{dealerId}, orderByKey+limitToLast) — never loaded whole
-   and never a table-wide query, since it's nested under each dealer's own
-   key rather than being a flat list. */
-async function loadDealerStockData() {
-  state.dealerStockLoading = true; state.dealerStockError = null;
-  renderCurrentView();
-  try {
-    state.dealerStock = (await dbGet('dealerStock')) || {};
-  } catch (e) {
-    state.dealerStockError = (e && e.message) || 'স্টক তথ্য লোড করা যায়নি — নেটওয়ার্ক বা Firebase Rules চেক করুন';
-    state.dealerStock = {};
-  }
-  state.dealerStockLoading = false;
-  renderCurrentView();
-}
-async function loadMyStock() {
-  state.myStockLoading = true;
-  renderCurrentView();
-  try {
-    state.myStock = (await dbGet(`dealerStock/${state.user.id}`)) || {};
-  } catch (e) {
-    state.myStock = {};
-  }
-  state.myStockLoading = false;
-  renderCurrentView();
-  loadStockHistoryForDealer(state.user.id, { intoModal: false });
-}
-function renderStockHistoryTable() {
-  const rows = state.stockHistoryRows || [];
-  if (state.stockHistoryLoading) return `<div class="loading">তথ্য লোড হচ্ছে...</div>`;
-  if (!rows.length) return emptyState('এখনো কোনো স্টক লেনদেন নেই।');
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>তারিখ</th><th>সার</th><th>ধরন</th><th>পরিমাণ</th><th>আগের মজুদ</th><th>নতুন মজুদ</th><th>যিনি করেছেন</th><th>মন্তব্য</th></tr></thead><tbody>${rows.map(r => `<tr><td>${formatDate(r.date)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${esc(STOCK_TX_TYPES[r.transactionType] || r.transactionType)}</td><td>${r.quantity} কেজি</td><td>${r.previousStock ?? '-'}</td><td>${r.newStock ?? '-'}</td><td>${esc(r.addedByName || '-')}</td><td>${dashIfEmpty(r.note)}</td></tr>`).join('')}</tbody></table></div>`;
-}
-// intoModal=true updates just the open modal's body (admin viewing a
-// dealer's history without leaving the Stock Dashboard); intoModal=false
-// re-renders the current page (dealer viewing their own history under
-// "আমার স্টক"). Always the SAME per-dealer path read either way — see the
-// note above the loaders in this section. Firebase push keys sort
-// chronologically, so orderByKey()+limitToLast(100) on this dealer's own
-// stockHistory/{dealerId} node returns exactly its most recent 100
-// transactions — no .indexOn, no orderByChild/equalTo query needed at all,
-// unlike the old flat stockHistory/{historyId} layout.
-async function loadStockHistoryForDealer(dealerId, opts) {
-  const intoModal = !!(opts && opts.intoModal);
-  state.stockHistoryDealerId = dealerId;
-  state.stockHistoryLoading = true;
-  if (intoModal) { const body = document.getElementById('stockHistoryModalBody'); if (body) body.innerHTML = renderStockHistoryTable(); }
-  else renderCurrentView();
-  try {
-    const snap = await get(query(ref(db, `stockHistory/${dealerId}`), orderByKey(), limitToLast(100)));
-    state.stockHistoryRows = objToArray(snap.exists() ? snap.val() : null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  } catch (e) {
-    state.stockHistoryRows = [];
-  }
-  state.stockHistoryLoading = false;
-  if (intoModal) { const body = document.getElementById('stockHistoryModalBody'); if (body) body.innerHTML = renderStockHistoryTable(); }
-  else renderCurrentView();
-}
-function openStockHistoryModal(dealerId) {
-  const dealer = state.dealers.find(d => d.id === dealerId);
-  state.stockHistoryRows = [];
-  openModal(`<h3>স্টক লেনদেনের ইতিহাস — ${esc(dealer ? dealer.name : '')}</h3><div id="stockHistoryModalBody">${renderStockHistoryTable()}</div>`);
-  loadStockHistoryForDealer(dealerId, { intoModal: true });
-}
-function renderDealerStockCard(d) {
-  const stock = state.dealerStock[d.id] || {};
-  return `
-    <div class="glass-card" style="margin-bottom:14px;">
-      <div class="row-between" style="margin-bottom:10px;">
-        <div><div style="font-weight:700;">${esc(d.name)}</div><div class="muted">${esc(d.union)} | ${esc(d.mobile)}</div></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-outline btn-sm" data-action="open-add-stock" data-dealer-id="${d.id}">+ স্টক যোগ করুন</button>
-          <button class="btn btn-outline btn-sm" data-action="view-stock-history" data-dealer-id="${d.id}">ইতিহাস</button>
-        </div>
-      </div>
-      <div class="table-wrap"><table class="mini-table"><thead><tr><th>সার</th><th>গৃহীত</th><th>বিতরণকৃত</th><th>মজুদ আছে</th></tr></thead><tbody>
-        ${FERTILIZERS.map(f => {
-          const row = stock[f.v] || emptyStockRow();
-          const available = Number(row.available) || 0;
-          const badgeCls = available <= 0 ? 'badge-red' : 'badge-green';
-          return `<tr><td>${esc(f.l)}</td><td>${(Number(row.received) || 0).toLocaleString('bn-BD')}</td><td>${(Number(row.distributed) || 0).toLocaleString('bn-BD')}</td><td><span class="badge ${badgeCls}">${available.toLocaleString('bn-BD')} কেজি</span></td></tr>`;
-        }).join('')}
-      </tbody></table></div>
-    </div>`;
-}
-function renderDealerStockDashboard() {
-  const search = (state.stockSearch || '').trim().toLowerCase();
-  const filteredDealers = state.dealers.filter(d => !search || (d.name || '').toLowerCase().includes(search) || (d.mobile || '').includes(search));
-  const totals = {};
-  FERTILIZERS.forEach(f => totals[f.v] = emptyStockRow());
-  state.dealers.forEach(d => {
-    const stock = state.dealerStock[d.id] || {};
-    FERTILIZERS.forEach(f => {
-      const row = stock[f.v] || emptyStockRow();
-      totals[f.v].received += Number(row.received) || 0;
-      totals[f.v].distributed += Number(row.distributed) || 0;
-      totals[f.v].available += Number(row.available) || 0;
-    });
-  });
-  return `
-    <div class="page-header"><h2>ডিলার স্টক ব্যবস্থাপনা</h2><button class="btn btn-primary btn-sm" data-action="open-add-stock">+ স্টক যোগ করুন</button></div>
-    <div class="glass-card" style="margin-bottom:16px;">
-      <h3 style="margin-bottom:10px;">সার্বিক স্টক সারাংশ (সকল ডিলার একত্রে)</h3>
-      <div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>মোট গৃহীত</th><th>মোট বিতরণকৃত</th><th>মোট মজুদ আছে</th></tr></thead><tbody>
-        ${FERTILIZERS.map(f => `<tr><td>${esc(f.l)}</td><td>${totals[f.v].received.toLocaleString('bn-BD')} কেজি</td><td>${totals[f.v].distributed.toLocaleString('bn-BD')} কেজি</td><td>${totals[f.v].available.toLocaleString('bn-BD')} কেজি</td></tr>`).join('')}
-      </tbody></table></div>
-    </div>
-    <div class="glass-card" style="margin-bottom:14px;">
-      <div class="field" style="margin-bottom:0;"><label>ডিলার খুঁজুন (নাম/মোবাইল)</label><input type="text" data-stock-search value="${esc(state.stockSearch || '')}" placeholder="ডিলারের নাম বা মোবাইল লিখুন"></div>
-    </div>
-    ${state.dealerStockLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : state.dealerStockError ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(state.dealerStockError)}</div>` : filteredDealers.length ? filteredDealers.map(d => renderDealerStockCard(d)).join('') : emptyState('কোনো ডিলার পাওয়া যায়নি।')}
-  `;
-}
-function renderMyStockDashboard() {
-  const stock = state.myStock || {};
-  return `
-    <div class="page-header"><h2>আমার স্টক</h2></div>
-    <div class="glass-card" style="margin-bottom:16px;">
-      ${state.myStockLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : `<div class="table-wrap"><table class="data-table"><thead><tr><th>সার</th><th>গৃহীত</th><th>বিতরণকৃত</th><th>মজুদ আছে</th></tr></thead><tbody>${FERTILIZERS.map(f => {
-        const row = stock[f.v] || emptyStockRow();
-        const available = Number(row.available) || 0;
-        const badgeCls = available <= 0 ? 'badge-red' : 'badge-green';
-        return `<tr><td>${esc(f.l)}</td><td>${(Number(row.received) || 0).toLocaleString('bn-BD')} কেজি</td><td>${(Number(row.distributed) || 0).toLocaleString('bn-BD')} কেজি</td><td><span class="badge ${badgeCls}">${available.toLocaleString('bn-BD')} কেজি</span></td></tr>`;
-      }).join('')}</tbody></table></div>`}
-    </div>
-    <div class="glass-card">
-      <h3 style="margin-bottom:10px;">স্টক লেনদেনের ইতিহাস (সাম্প্রতিক ১০০টি)</h3>
-      ${renderStockHistoryTable()}
-    </div>
-  `;
-}
-function openAddStockModal(dealerId) {
-  const dealers = state.dealers.filter(d => d.status !== 'inactive');
-  openModal(`
-    <h3>স্টক যোগ করুন (কিস্তি)</h3>
-    <p class="muted" style="margin-top:-6px;margin-bottom:12px;">প্রতিবার এখানে যোগ করা পরিমাণ আগের মজুদের সাথে যুক্ত হয় — একাধিক কিস্তিতে ধাপে ধাপে স্টক দেওয়া যায়।</p>
-    <form id="addStockForm">
-      <div class="field">
-        <label>ডিলার</label>
-        <select name="dealerId" ${dealerId ? 'disabled' : ''} required>
-          <option value="">-- নির্বাচন করুন --</option>
-          ${dealers.map(d => `<option value="${d.id}" ${d.id === dealerId ? 'selected' : ''}>${esc(d.name)} (${esc(d.union)})</option>`).join('')}
-        </select>
-        ${dealerId ? `<input type="hidden" name="dealerIdFixed" value="${esc(dealerId)}">` : ''}
-      </div>
-      <div class="field"><label>সারের নাম</label><select name="fertilizer" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
-      <div id="addStockCurrentInfo" class="muted" style="margin:-6px 0 14px;"></div>
-      <div class="form-grid cols-2">
-        <div class="field"><label>এই কিস্তিতে পরিমাণ (কেজি)</label><input type="number" name="quantity" min="0.5" step="0.5" required></div>
-        <div class="field"><label>তারিখ</label><input type="date" name="date" value="${todayStr()}" max="${todayStr()}" required></div>
-      </div>
-      <div class="field"><label>রেফারেন্স/নোট (ঐচ্ছিক)</label><input type="text" name="note" placeholder="যেমন: ১ম কিস্তি"></div>
-      <button type="submit" class="btn btn-primary" id="addStockSubmitBtn" style="width:100%;">সংরক্ষণ করুন</button>
-    </form>
-  `);
-  updateAddStockCurrentInfo();
-}
-// Live "কিস্তি wise" preview — shows the CURRENT stock (before this add) the
-// moment dealer+fertilizer are both chosen, reusing state.dealerStock that
-// is already loaded (this modal only ever opens from the Stock Dashboard,
-// which loads it first) — no extra Firebase read just to show this.
-function updateAddStockCurrentInfo() {
-  const form = document.getElementById('addStockForm');
-  const infoEl = document.getElementById('addStockCurrentInfo');
-  if (!form || !infoEl) return;
-  const dealerId = form.dealerIdFixed ? form.dealerIdFixed.value : form.dealerId.value;
-  const fertilizer = form.fertilizer.value;
-  if (!dealerId || !fertilizer) { infoEl.textContent = ''; return; }
-  const row = (state.dealerStock[dealerId] && state.dealerStock[dealerId][fertilizer]) || emptyStockRow();
-  const available = Number(row.available) || 0;
-  const received = Number(row.received) || 0;
-  infoEl.innerHTML = `বর্তমান মজুদ (এই কিস্তির আগে): <b>${available.toLocaleString('bn-BD')} কেজি</b> · এ পর্যন্ত মোট গৃহীত: ${received.toLocaleString('bn-BD')} কেজি`;
-}
-async function handleAddStockSubmit(form) {
-  if (isSubmitting) return;
-  const dealerId = form.dealerIdFixed ? form.dealerIdFixed.value : form.dealerId.value;
-  const fertilizer = form.fertilizer.value;
-  const quantity = parseFloat(form.quantity.value);
-  const date = form.date.value;
-  const note = form.note.value.trim();
-  if (!dealerId) { showToast('ডিলার নির্বাচন করুন', 'error'); return; }
-  if (!fertilizer) { showToast('সারের নাম নির্বাচন করুন', 'error'); return; }
-  if (!quantity || quantity <= 0) { showToast('সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
-  if (date && new Date(date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
-  const dealer = state.dealers.find(d => d.id === dealerId);
-  if (!dealer) { showToast('ডিলার পাওয়া যায়নি', 'error'); return; }
-  isSubmitting = true;
-  const btn = document.getElementById('addStockSubmitBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
-  try {
-    const stockRef = ref(db, `dealerStock/${dealerId}/${fertilizer}`);
-    let previousStock = 0, newStock = 0;
-    const txResult = await runTransaction(stockRef, (current) => {
-      const cur = current || emptyStockRow();
-      previousStock = Number(cur.available) || 0;
-      newStock = previousStock + quantity;
-      return { received: (Number(cur.received) || 0) + quantity, distributed: Number(cur.distributed) || 0, available: newStock };
-    });
-    if (!txResult.committed) throw new Error('স্টক আপডেট করা যায়নি');
-    await dbPush(`stockHistory/${dealerId}`, {
-      dealerId, dealerName: dealer.name, fertilizer,
-      transactionType: 'STOCK_RECEIVED', quantity, previousStock, newStock,
-      addedBy: state.user.uid, addedByName: state.user.name,
-      note, date: date || todayStr(), createdAt: Date.now(),
-    });
-    if (!state.dealerStock[dealerId]) state.dealerStock[dealerId] = {};
-    const prevRow = state.dealerStock[dealerId][fertilizer] || emptyStockRow();
-    state.dealerStock[dealerId][fertilizer] = { received: (Number(prevRow.received) || 0) + quantity, distributed: Number(prevRow.distributed) || 0, available: newStock };
-    showToast(`স্টক যুক্ত হয়েছে (কিস্তি) — পূর্ববর্তী স্টক: ${previousStock.toLocaleString('bn-BD')} কেজি → নতুন স্টক: ${newStock.toLocaleString('bn-BD')} কেজি`, 'success');
-    writeSystemLog('data_entry', 'stock_added', `${dealer.name} — ${fertilizerLabel(fertilizer)} +${quantity} কেজি`);
-    closeModal();
-    renderCurrentView();
-  } catch (e) {
-    showToast('স্টক যোগ করা যায়নি: ' + ((e && e.message) || ''), 'error');
-  } finally {
-    isSubmitting = false;
   }
 }
 
@@ -3032,18 +2252,11 @@ function applyCommonFilters(rows, opts) {
 }
 function renderDistributionRecords() {
   const rows = distPage.rows;
-  // Security Rules only ever grant distributions/$recordId delete/write to
-  // the Main Admin UID — UNO shares every other admin data view via this
-  // same render function, but was still being shown a "মুছুন" button that
-  // would always fail with a Firebase permission error if clicked. Hiding
-  // the column for UNO matches what the Rules actually allow, instead of
-  // promising an action that silently fails.
-  const canDelete = state.user.role === 'admin';
   return `
-    <div class="page-header"><h2>বিতরণ রেকর্ড</h2><button class="btn btn-outline btn-sm" data-action="export-current-page">${ic('export', 'icon-sm')} CSV ডাউনলোড (এই পেজ)</button></div>
+    <div class="page-header"><h2>বিতরণ রেকর্ড</h2><button class="btn btn-outline btn-sm" data-action="export-distributions">${ic('export', 'icon-sm')} CSV এক্সপোর্ট (ফিল্টার অনুযায়ী সব)</button></div>
     ${renderFilterBar()}
     <div class="glass-card table-wrap">
-      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th>${canDelete ? '<th>অ্যাকশন</th>' : ''}</tr></thead><tbody>${rows.map((r, i) => `<tr><td>${(distPage.pageNumber - 1) * PAGE_SIZE + i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(cropLabel(r))}</td><td>${formatDate(r.date)}</td>${canDelete ? `<td><button class="btn btn-danger btn-sm" data-action="delete-record-row" data-id="${r.id}" data-source="distribution-list">মুছুন</button></td>` : ''}</tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th><th>অ্যাকশন</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${(distPage.pageNumber - 1) * PAGE_SIZE + i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(cropLabel(r))}</td><td>${formatDate(r.date)}</td><td><button class="btn btn-danger btn-sm" data-action="delete-record-row" data-id="${r.id}" data-source="distribution-list">মুছুন</button></td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
       ${!distPage.loading && !distPage.error ? renderDistPaginationBar() : ''}
     </div>
   `;
@@ -3069,23 +2282,14 @@ function renderDeleteRecordsPage() {
     </div>
   `;
 }
-function filteredDuplicateRows() {
-  return applyCommonFilters(state.duplicates || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-}
 function renderDuplicateLog() {
-  const allRows = filteredDuplicateRows();
-  const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE));
-  if (dupPage.pageNumber > totalPages) dupPage.pageNumber = totalPages;
-  const rows = allRows.slice((dupPage.pageNumber - 1) * PAGE_SIZE, dupPage.pageNumber * PAGE_SIZE);
+  const rows = applyCommonFilters(state.duplicates);
   return `
-    <div class="page-header"><h2>ডুপ্লিকেট চেষ্টার লগ</h2><button class="btn btn-outline btn-sm" data-action="export-duplicates">${ic('export', 'icon-sm')} CSV ডাউনলোড (এই পেজ)</button></div>
-    ${state.duplicatesError ? `<div class="duplicate-alert" style="border-color:#C62828;background:#FDECEA;">${ic('warn')}<div><h4>ডুপ্লিকেট চেষ্টার তথ্য লোড করা যায়নি</h4><p><span class="muted" style="font-size:11.5px;">টেকনিক্যাল বার্তা: ${esc(state.duplicatesError)}</span><br><button type="button" class="btn btn-outline btn-sm" data-action="retry-load-duplicates" style="margin-top:8px;">আবার চেষ্টা করুন</button></div></div>` : ''}
+    <div class="page-header"><h2>ডুপ্লিকেট চেষ্টার লগ</h2><button class="btn btn-outline btn-sm" data-action="export-duplicates">${ic('export', 'icon-sm')} CSV এক্সপোর্ট</button></div>
     ${renderFilterBar()}
-    <p class="muted" style="margin-bottom:10px;">সাম্প্রতিক সর্বোচ্চ ${RECENT_WINDOW} টি ডুপ্লিকেট চেষ্টা লোড করা হয়েছে (পুরো টেবিল স্ক্যান করা হয় না) — উপরের ফিল্টার এই এন্ট্রিগুলোর মধ্যেই প্রয়োগ হয়।</p>
     <div class="glass-card table-wrap">
-      ${state.duplicatesLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>সার</th><th>চেষ্টার তারিখ</th><th>পূর্বের তারিখ</th><th>ডিলার (চেষ্টাকারী)</th><th>ইউনিয়ন</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${(dupPage.pageNumber - 1) * PAGE_SIZE + i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${formatDate(r.date)}</td><td>${formatDate(r.existingDate)}</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো ডুপ্লিকেট চেষ্টা রেকর্ড নেই — সবকিছু ঠিক আছে।')}
+      ${rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>সার</th><th>চেষ্টার তারিখ</th><th>পূর্বের তারিখ</th><th>ডিলার (চেষ্টাকারী)</th><th>ইউনিয়ন</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${formatDate(r.date)}</td><td>${formatDate(r.existingDate)}</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো ডুপ্লিকেট চেষ্টা রেকর্ড নেই — সবকিছু ঠিক আছে।')}
     </div>
-    ${!state.duplicatesLoading && allRows.length ? renderWindowPaginationBar(dupPage, allRows.length, 'dup-prev-page', 'dup-next-page') : ''}
   `;
 }
 
@@ -3226,7 +2430,7 @@ function renderExportData() {
     <div class="glass-card stack" style="max-width:480px;">
       <div class="row-between"><div><div style="font-weight:600;">সকল বিতরণ রেকর্ড</div><div class="muted">${(state.dashboardStats && state.dashboardStats.totalDistributions) || 0} টি রেকর্ড</div></div><button class="btn btn-primary btn-sm" data-action="export-distributions">CSV ডাউনলোড</button></div>
       <div class="row-between"><div><div style="font-weight:600;">ডিলার তালিকা</div><div class="muted">${state.dealers.length} জন ডিলার</div></div><button class="btn btn-primary btn-sm" data-action="export-dealers">CSV ডাউনলোড</button></div>
-      <div class="row-between"><div><div style="font-weight:600;">ডুপ্লিকেট চেষ্টার লগ</div><div class="muted">${(state.dashboardStats && state.dashboardStats.duplicateAttempts) || 0} টি এন্ট্রি</div></div><button class="btn btn-primary btn-sm" data-action="export-duplicates-full">CSV ডাউনলোড</button></div>
+      <div class="row-between"><div><div style="font-weight:600;">ডুপ্লিকেট চেষ্টার লগ</div><div class="muted">${state.duplicates.length} টি এন্ট্রি</div></div><button class="btn btn-primary btn-sm" data-action="export-duplicates">CSV ডাউনলোড</button></div>
     </div>
     <p class="muted" style="margin-top:14px;">PDF ও Excel ফরম্যাটে এক্সপোর্ট এবং প্রিন্ট-ফ্রেন্ডলি স্লিপ পরবর্তী আপডেটে যুক্ত হবে।</p>
   `;
@@ -3234,7 +2438,7 @@ function renderExportData() {
 
 /* ---------------- settings ---------------- */
 function renderSettings() {
-  const upcoming = ['QR কৃষক কার্ড ও QR স্ক্যান করে বিতরণ', 'SMS রিসিপ্ট সিমুলেশন ও বিতরণ স্লিপ প্রিন্ট', 'PDF ও Excel এক্সপোর্ট', 'ব্ল্যাকলিস্টেড কৃষক তালিকা', 'ব্যাকআপ ও রিস্টোর', 'ডার্ক মোড', 'অফলাইন সাপোর্ট (PWA)'];
+  const upcoming = ['QR কৃষক কার্ড ও QR স্ক্যান করে বিতরণ', 'SMS রিসিপ্ট সিমুলেশন ও বিতরণ স্লিপ প্রিন্ট', 'PDF ও Excel এক্সপোর্ট', 'সার স্টক ম্যানেজমেন্ট ও লো-স্টক অ্যালার্ট', 'ব্ল্যাকলিস্টেড কৃষক তালিকা', 'ব্যাকআপ ও রিস্টোর', 'ডার্ক মোড', 'অফলাইন সাপোর্ট (PWA)'];
   return `
     <div class="page-header"><h2>সেটিংস</h2></div>
     <div class="glass-card" style="max-width:560px;margin-bottom:16px;">
@@ -3252,25 +2456,11 @@ function renderSettings() {
           </label>
         </div>`).join('')}
     </div>
-    <div class="glass-card" style="max-width:560px;margin-bottom:16px;">
-      <h3 style="margin-bottom:4px;">ড্যাশবোর্ড পরিসংখ্যান পুনঃগণনা</h3>
-      <p class="muted" style="margin-bottom:10px;">সব বিতরণ রেকর্ড আবার স্ক্যান করে মোট কৃষক, সার, ইউনিয়ন, ডিলার ও <b>কৃষক শ্রেণী (ছোট/মাঝারি/বড়)</b>-এর পরিসংখ্যান নতুন করে গণনা করে। এই আপডেটের পর একবার চালানো জরুরি — তা না হলে আগের কৃষকরা এখনো কৃষক শ্রেণী ড্যাশবোর্ডে গণনায় আসবেন না (শুধু আজকের পর থেকে নতুন কৃষকরা আসবেন)। বড় ডেটাবেজেও এটি ব্যাচে ব্যাচে (২,০০০ রেকর্ড করে) চলে, পুরো টেবিল একসাথে লোড করে না।</p>
-      <button type="button" class="btn btn-outline btn-sm" data-action="rebuild-stats" ${state.dashboardStatsRebuilding ? 'disabled' : ''}>${state.dashboardStatsRebuilding ? 'পুনঃগণনা চলছে...' : 'এখনই পুনঃগণনা করুন'}</button>
-    </div>
     <div class="glass-card" style="max-width:560px;">
       <h3>আসছে পরবর্তী আপডেটে</h3>
       ${upcoming.map(u => `<div class="check-item">${ic('check', 'icon-sm')}<span>${esc(u)}</span></div>`).join('')}
     </div>
   `;
-}
-async function handleRebuildStatsClick() {
-  if (state.dashboardStatsRebuilding) return;
-  showToast('পুনঃগণনা শুরু হয়েছে — বড় ডেটাবেজে কিছুক্ষণ সময় লাগতে পারে, পেজ ছেড়ে যাবেন না', 'info');
-  renderCurrentView();
-  await rebuildDashboardStatsInBackground();
-  showToast('ড্যাশবোর্ড পরিসংখ্যান পুনঃগণনা সম্পন্ন হয়েছে', 'success');
-  writeSystemLog('settings', 'stats_rebuilt', 'ড্যাশবোর্ড পরিসংখ্যান (কৃষক শ্রেণীসহ) পুনঃগণনা করা হয়েছে');
-  renderCurrentView();
 }
 async function handleFormFieldToggle(key, checked) {
   const prev = state.formFieldSettings[key];
@@ -3316,35 +2506,6 @@ async function decrementDashboardStatsForRecord(record) {
     runTransaction(ref(db, `dashboardStats/dealerStats/${record.dealerId}/totalDistributions`), dec(1)),
     runTransaction(ref(db, `dashboardStats/dealerStats/${record.dealerId}/totalFertilizer`), dec(qty)),
   ]);
-}
-/* Deleting a distribution record (data-entry mistake correction) means that
-   fertilizer never actually left the dealer's hands — so the stock this
-   update introduced must be restored, or the dealer would be permanently
-   short by that amount for no reason. Logged as a STOCK_ADJUSTMENT entry
-   (not DISTRIBUTION) so the stock history clearly shows why it moved. */
-async function restoreDealerStockForDeletedRecord(record) {
-  if (!record || !record.dealerId || !record.fertilizer) return;
-  const qty = Number(record.quantity) || 0;
-  if (qty <= 0) return;
-  try {
-    const stockRef = ref(db, `dealerStock/${record.dealerId}/${record.fertilizer}`);
-    let previousStock = 0, newStock = 0;
-    const txResult = await runTransaction(stockRef, (current) => {
-      const cur = current || emptyStockRow();
-      previousStock = Number(cur.available) || 0;
-      newStock = previousStock + qty;
-      return { received: Number(cur.received) || 0, distributed: Math.max(0, (Number(cur.distributed) || 0) - qty), available: newStock };
-    });
-    if (txResult.committed) {
-      await dbPush(`stockHistory/${record.dealerId}`, {
-        dealerId: record.dealerId, dealerName: record.dealerName || '', fertilizer: record.fertilizer,
-        transactionType: 'STOCK_ADJUSTMENT', quantity: qty, previousStock, newStock,
-        addedBy: state.user.uid, addedByName: state.user.name,
-        note: `রেকর্ড মুছে ফেলায় স্টক ফেরত — কৃষক: ${record.farmerName || record.nid || ''}`,
-        date: todayStr(), createdAt: Date.now(),
-      });
-    }
-  } catch (e) { /* best-effort — the distribution delete itself must not be blocked by this */ }
 }
 
 function findRecordByIdInCurrentViews(recordId) {
@@ -3421,24 +2582,16 @@ function openDeleteRecordModal(record) {
 }
 
 async function handleDeleteDistributionSubmit(form) {
-  // Same double-submit guard every other mutating handler in this file
-  // uses — a permanent delete is exactly the kind of action where a
-  // double-click race (two overlapping deletes/restores firing before the
-  // button's disabled state takes effect) is worth closing off, even
-  // though the window was narrow.
-  if (isSubmitting) return;
   const recordId = form.dataset.id;
   const confirmText = (form.confirmText.value || '').trim();
   if (confirmText !== 'DELETE') { showToast('নিশ্চিত করতে ঠিক "DELETE" লিখুন', 'error'); return; }
   const record = findRecordByIdInCurrentViews(recordId) || null;
   if (!record) { showToast('এই রেকর্ডটি আর পাওয়া যাচ্ছে না', 'error'); return; }
-  isSubmitting = true;
   const btn = document.getElementById('deleteDistributionSubmitBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'মুছে ফেলা হচ্ছে...'; }
   try {
     await remove(ref(db, `distributions/${recordId}`));
     await decrementDashboardStatsForRecord(record);
-    await restoreDealerStockForDeletedRecord(record);
     state.deleteRecords = (state.deleteRecords || []).filter(r => r.id !== recordId);
     if (distPage.rowCache && distPage.rowCache.size) {
       distPage.rowCache.clear();
@@ -3453,13 +2606,11 @@ async function handleDeleteDistributionSubmit(form) {
     showToast('মুছে ফেলা যায়নি: ' + ((e && e.message) || ''), 'error');
     writeSystemLog('error', 'distribution_delete_failed', (e && e.message) || 'unknown');
     if (btn) { btn.disabled = false; btn.textContent = 'স্থায়ীভাবে মুছুন'; }
-  } finally {
-    isSubmitting = false;
   }
 }
 
 /* ---------------- system logs (Main Admin only) ---------------- */
-function filteredSystemLogRows() {
+function renderSystemLogs() {
   const active = state.logFilter || 'all';
   let rows = state.systemLogs || [];
   if (active === 'success') rows = rows.filter(l => l.logType !== 'error' && l.logType !== 'wrong_login');
@@ -3468,16 +2619,9 @@ function filteredSystemLogRows() {
   if (state.filters.dateTo) rows = rows.filter(l => l.timestamp <= new Date(state.filters.dateTo + 'T23:59:59').getTime());
   const q = (state.filters.search || '').toLowerCase();
   if (q) rows = rows.filter(l => (l.email || '').toLowerCase().includes(q) || (l.name || '').toLowerCase().includes(q) || (l.message || '').toLowerCase().includes(q) || (l.action || '').toLowerCase().includes(q));
-  return rows.slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-}
-function renderSystemLogs() {
-  const active = state.logFilter || 'all';
-  const allRows = filteredSystemLogRows();
-  const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE));
-  if (logPage.pageNumber > totalPages) logPage.pageNumber = totalPages;
-  const rows = allRows.slice((logPage.pageNumber - 1) * PAGE_SIZE, logPage.pageNumber * PAGE_SIZE);
+  rows = rows.slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
   return `
-    <div class="page-header"><h2>সিস্টেম লগ</h2><button class="btn btn-outline btn-sm" data-action="export-logs">${ic('export', 'icon-sm')} CSV ডাউনলোড (এই পেজ)</button></div>
+    <div class="page-header"><h2>সিস্টেম লগ</h2><button class="btn btn-outline btn-sm" data-action="export-logs">${ic('export', 'icon-sm')} CSV এক্সপোর্ট</button></div>
     ${state.systemLogsError ? `<div class="duplicate-alert" style="border-color:#C62828;background:#FDECEA;">${ic('warn')}<div><h4>সিস্টেম লগ লোড করা যায়নি</h4><p>এর সবচেয়ে সাধারণ কারণ: Firebase Console-এ Realtime Database Rules-এ এখনো "systemLogs" node-এর নিয়ম যোগ করা হয়নি। Firebase Console → Realtime Database → Rules-এ গিয়ে সর্বশেষ Rules paste করে Publish করুন, তারপর নিচের বাটনে চাপুন।<br><span class="muted" style="font-size:11.5px;">টেকনিক্যাল বার্তা: ${esc(state.systemLogsError)}</span><br><button type="button" class="btn btn-outline btn-sm" data-action="retry-load-logs" style="margin-top:8px;">আবার চেষ্টা করুন</button></div></div>` : ''}
     <div class="login-tabs" style="flex-wrap:wrap;max-width:900px;margin-bottom:14px;height:auto;">
       ${Object.entries(LOG_CATEGORIES).map(([k, l]) => `<div class="login-tab ${active === k ? 'active' : ''}" data-action="set-log-filter" data-type="${k}" style="flex:none;padding:8px 14px;">${esc(l)}</div>`).join('')}
@@ -3487,23 +2631,15 @@ function renderSystemLogs() {
       <div class="field"><label>তারিখ পর্যন্ত</label><input type="date" data-filter="dateTo" value="${state.filters.dateTo}"></div>
       <div class="field" style="grid-column:span 2;"><label>খুঁজুন (নাম/ইমেইল/বার্তা)</label><input type="text" data-filter="search" value="${esc(state.filters.search || '')}"></div>
     </div>
-    <p class="muted" style="margin-bottom:10px;">সাম্প্রতিক সর্বোচ্চ ${RECENT_WINDOW} টি লগ এন্ট্রি লোড করা হয়েছে (পুরো লগ টেবিল স্ক্যান করা হয় না) — উপরের ফিল্টার এই এন্ট্রিগুলোর মধ্যেই প্রয়োগ হয়।</p>
     ${active === 'wrong_login' ? `<p class="muted" style="margin-bottom:10px;">নিরাপত্তার নীতি অনুযায়ী (unauthenticated ব্যবহারকারী কখনো ডেটাবেজে write করতে পারে না), ব্যর্থ লগইন চেষ্টা স্থায়ীভাবে সংরক্ষণ করা হয় না — সাথে সাথে শুধু ব্যবহারকারীকে বার্তা দেখানো হয়।</p>` : ''}
     <div class="glass-card table-wrap">
-      ${state.systemLogsLoading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>সময়</th><th>ধরন</th><th>একশন</th><th>ব্যবহারকারী</th><th>ভূমিকা</th><th>বার্তা</th></tr></thead><tbody>${rows.map((l, i) => `<tr><td>${(logPage.pageNumber - 1) * PAGE_SIZE + i + 1}</td><td>${new Date(l.timestamp).toLocaleString('bn-BD')}</td><td>${esc(LOG_CATEGORIES[l.logType] || l.logType)}</td><td>${esc(l.action)}</td><td>${esc(l.name || l.email || '-')}</td><td>${esc(ROLE_LABELS[l.role] || l.role || '-')}</td><td>${esc(l.message || '-')}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো লগ পাওয়া যায়নি।')}
+      ${rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>সময়</th><th>ধরন</th><th>একশন</th><th>ব্যবহারকারী</th><th>ভূমিকা</th><th>বার্তা</th></tr></thead><tbody>${rows.map((l, i) => `<tr><td>${i + 1}</td><td>${new Date(l.timestamp).toLocaleString('bn-BD')}</td><td>${esc(LOG_CATEGORIES[l.logType] || l.logType)}</td><td>${esc(l.action)}</td><td>${esc(l.name || l.email || '-')}</td><td>${esc(ROLE_LABELS[l.role] || l.role || '-')}</td><td>${esc(l.message || '-')}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো লগ পাওয়া যায়নি।')}
     </div>
-    ${!state.systemLogsLoading && allRows.length ? renderWindowPaginationBar(logPage, allRows.length, 'log-prev-page', 'log-next-page') : ''}
   `;
 }
-// Downloads only the currently-visible page (already loaded in memory) —
-// never the full RECENT_WINDOW set, let alone the whole systemLogs node.
 function exportLogsCSV() {
-  const allRows = filteredSystemLogRows();
-  const rows = allRows.slice((logPage.pageNumber - 1) * PAGE_SIZE, logPage.pageNumber * PAGE_SIZE);
-  if (!rows.length) { showToast('এই পেজে কোনো লগ নেই — ডাউনলোড করার কিছু নেই', 'error'); return; }
-  const csvRows = rows.map(l => [new Date(l.timestamp).toLocaleString('bn-BD'), LOG_CATEGORIES[l.logType] || l.logType, l.action, l.name || l.email || '-', ROLE_LABELS[l.role] || l.role || '-', l.message || '-']);
-  downloadCSV(`system_logs_page_${logPage.pageNumber}.csv`, toCSV(['সময়', 'ধরন', 'একশন', 'ব্যবহারকারী', 'ভূমিকা', 'বার্তা'], csvRows));
-  showToast(`এই পেজের ${rows.length} টি লগ ডাউনলোড হয়েছে`, 'success');
+  const rows = (state.systemLogs || []).map(l => [new Date(l.timestamp).toLocaleString('bn-BD'), LOG_CATEGORIES[l.logType] || l.logType, l.action, l.name || l.email || '-', ROLE_LABELS[l.role] || l.role || '-', l.message || '-']);
+  downloadCSV('system_logs.csv', toCSV(['সময়', 'ধরন', 'একশন', 'ব্যবহারকারী', 'ভূমিকা', 'বার্তা'], rows));
 }
 
 /* ---------------- CSV export ---------------- */
@@ -3531,28 +2667,12 @@ function downloadCSV(filename, csvContent) {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-// Shared column layout for every distribution CSV export — the full,
-// batched "ডেটা এক্সপোর্ট" export AND the current-page-only downloads on
-// "বিতরণ রেকর্ড" / "বিতরণ ইতিহাস" all build the same columns from whatever
-// row list they're given, so there is exactly one place that defines them.
-const DISTRIBUTION_CSV_HEADERS = ['#', 'কৃষকের নাম', 'এনআইডি', 'মোবাইল', 'ইউনিয়ন', 'গ্রাম', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান নং', 'ফসল', 'সারের নাম', 'পরিমাণ(কেজি)', 'ডিলার', 'ডিলার আইডি', 'তারিখ', 'মন্তব্য', 'ব্যাচ আইডি', 'তৈরি সময়'];
-function buildDistributionCsvRows(list) {
-  return list.map((r, i) => [
-    i + 1, r.farmerName || '', csvTextGuard(r.nid), csvPhone(r.mobile), r.union || '', r.village || '',
-    r.landArea ?? '', r.mouza || '', r.dagNumber || '', r.khatianNumber || '', cropLabel(r) || '',
-    fertilizerLabel(r.fertilizer), r.quantity ?? '', r.dealerName || '', r.dealerId || '',
-    csvDate(r.date), r.remarks || '', r.batchId || '', r.createdAt || ''
-  ]);
-}
 async function exportDistributionsCSV() {
   // Large-export path (spec #7): reads from Firebase in 2000-row batches via
   // query()+limitToFirst — never pulls the whole 70K/100K+ table into the
   // browser at once, even for a full unfiltered export. NID is guarded
   // against Excel scientific-notation corruption (spec #6), and the CSV is
-  // exported as raw row data rather than a pre-aggregated summary. This is
-  // the DEDICATED full-export tool on "ডেটা এক্সপোর্ট" — the "বিতরণ রেকর্ড"
-  // list page itself never triggers a full-table download any more, see
-  // exportCurrentDistPageCSV below.
+  // exported as raw row data rather than a pre-aggregated summary.
   const btn = document.querySelector('[data-action="export-distributions"]');
   const origText = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'এক্সপোর্ট হচ্ছে... (0)'; }
@@ -3560,7 +2680,48 @@ async function exportDistributionsCSV() {
     const all = await fetchAllDistributionsForExport(state.filters, (count) => {
       if (btn) btn.textContent = `এক্সপোর্ট হচ্ছে... (${count})`;
     });
-    downloadCSV('distributions.csv', toCSV(DISTRIBUTION_CSV_HEADERS, buildDistributionCsvRows(all)));
+    const rows = all.map((r, i) => [
+      i + 1,
+      r.farmerName || '',
+      csvTextGuard(r.nid),
+      csvPhone(r.mobile),
+      r.union || '',
+      r.village || '',
+      r.landArea ?? '',
+      r.mouza || '',
+      r.dagNumber || '',
+      r.khatianNumber || '',
+      cropLabel(r) || '',
+      fertilizerLabel(r.fertilizer),
+      r.quantity ?? '',
+      r.dealerName || '',
+      r.dealerId || '',
+      csvDate(r.date),
+      r.remarks || '',
+      r.batchId || '',
+      r.createdAt || ''
+    ]);
+    downloadCSV('distributions.csv', toCSV([
+      '#',
+      'কৃষকের নাম',
+      'এনআইডি',
+      'মোবাইল',
+      'ইউনিয়ন',
+      'গ্রাম',
+      'জমি(শতাংশ)',
+      'মৌজা',
+      'দাগ নম্বর',
+      'খতিয়ান নং',
+      'ফসল',
+      'সারের নাম',
+      'পরিমাণ(কেজি)',
+      'ডিলার',
+      'ডিলার আইডি',
+      'তারিখ',
+      'মন্তব্য',
+      'ব্যাচ আইডি',
+      'তৈরি সময়'
+    ], rows));
     showToast(`${all.length} টি রেকর্ড এক্সপোর্ট সম্পন্ন হয়েছে`, 'success');
   } catch (e) {
     showToast('এক্সপোর্ট ব্যর্থ হয়েছে: ' + ((e && e.message) || ''), 'error');
@@ -3568,38 +2729,13 @@ async function exportDistributionsCSV() {
     if (btn) { btn.disabled = false; btn.textContent = origText; }
   }
 }
-// Downloads ONLY the page currently on screen (distPage.rows — already
-// loaded in memory for display, so this needs no extra Firebase read at
-// all) with whatever filter is active. Used by both the admin/UNO "বিতরণ
-// রেকর্ড" page and the dealer's own "বিতরণ ইতিহাস" page — never an
-// unbounded "every matching record" download from either.
-function exportCurrentDistPageCSV() {
-  const rows = distPage.rows || [];
-  if (!rows.length) { showToast('এই পেজে কোনো রেকর্ড নেই — ডাউনলোড করার কিছু নেই', 'error'); return; }
-  downloadCSV(`distributions_page_${distPage.pageNumber}.csv`, toCSV(DISTRIBUTION_CSV_HEADERS, buildDistributionCsvRows(rows)));
-  showToast(`এই পেজের ${rows.length} টি রেকর্ড ডাউনলোড হয়েছে`, 'success');
-}
-// Dealer's own প্রোফাইল page — downloads exactly the same ≤50-row preview
-// already loaded there (state.dealerRecentDistributions, see
-// loadDealerDashboardExtras), never a fresh full-table read.
-function exportMyRecentDistributionsCSV() {
-  const rows = state.dealerRecentDistributions || [];
-  if (!rows.length) { showToast('ডাউনলোড করার মতো কোনো রেকর্ড নেই', 'error'); return; }
-  downloadCSV('my_recent_distributions.csv', toCSV(DISTRIBUTION_CSV_HEADERS, buildDistributionCsvRows(rows)));
-  showToast(`${rows.length} টি রেকর্ড ডাউনলোড হয়েছে`, 'success');
-}
 function exportDealersCSV() {
   const rows = state.dealers.map((d, i) => [i + 1, d.name, csvPhone(d.mobile), d.email, d.union, d.area, d.status === 'inactive' ? 'নিষ্ক্রিয়' : 'সক্রিয়']);
   downloadCSV('dealers.csv', toCSV(['#', 'নাম', 'মোবাইল', 'ইমেইল', 'ইউনিয়ন', 'এলাকা', 'স্ট্যাটাস'], rows));
 }
-// Downloads only the currently-visible page — never the full loaded window.
 function exportDuplicatesCSV() {
-  const allRows = filteredDuplicateRows();
-  const pageRows = allRows.slice((dupPage.pageNumber - 1) * PAGE_SIZE, dupPage.pageNumber * PAGE_SIZE);
-  if (!pageRows.length) { showToast('এই পেজে কোনো এন্ট্রি নেই — ডাউনলোড করার কিছু নেই', 'error'); return; }
-  const rows = pageRows.map((r, i) => [i + 1, r.farmerName, csvTextGuard(r.nid), fertilizerLabel(r.fertilizer), csvDate(r.date), csvDate(r.existingDate), r.dealerName, r.union]);
-  downloadCSV(`duplicate_attempts_page_${dupPage.pageNumber}.csv`, toCSV(['#', 'কৃষক', 'এনআইডি', 'সার', 'চেষ্টার তারিখ', 'পূর্বের তারিখ', 'ডিলার', 'ইউনিয়ন'], rows));
-  showToast(`এই পেজের ${pageRows.length} টি এন্ট্রি ডাউনলোড হয়েছে`, 'success');
+  const rows = state.duplicates.map((r, i) => [i + 1, r.farmerName, csvTextGuard(r.nid), fertilizerLabel(r.fertilizer), csvDate(r.date), csvDate(r.existingDate), r.dealerName, r.union]);
+  downloadCSV('duplicate_attempts.csv', toCSV(['#', 'কৃষক', 'এনআইডি', 'সার', 'চেষ্টার তারিখ', 'পূর্বের তারিখ', 'ডিলার', 'ইউনিয়ন'], rows));
 }
 function exportReportCSV() {
   const table = document.querySelector('#mainContent table.data-table');
@@ -3634,26 +2770,16 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     }
     case 'toggle-uno-status': await handleToggleUnoStatus(target.dataset.id); break;
     case 'reset-uno-password': await handleSendUnoPasswordReset(target.dataset.id); break;
-    case 'set-log-filter': state.logFilter = target.dataset.type; logPage.pageNumber = 1; renderCurrentView(); break;
+    case 'set-log-filter': state.logFilter = target.dataset.type; renderCurrentView(); break;
     case 'export-logs': exportLogsCSV(); break;
-    case 'log-prev-page': logPage.pageNumber = Math.max(1, logPage.pageNumber - 1); renderCurrentView(); break;
-    case 'log-next-page': logPage.pageNumber += 1; renderCurrentView(); break;
-    case 'dup-prev-page': dupPage.pageNumber = Math.max(1, dupPage.pageNumber - 1); renderCurrentView(); break;
-    case 'dup-next-page': dupPage.pageNumber += 1; renderCurrentView(); break;
-    case 'dealer-recent-prev-page': dealerRecentPage.pageNumber = Math.max(1, dealerRecentPage.pageNumber - 1); renderCurrentView(); break;
-    case 'dealer-recent-next-page': dealerRecentPage.pageNumber += 1; renderCurrentView(); break;
-    case 'retry-load-duplicates': await loadDuplicatesOnly(); break;
     case 'retry-load': await loadAllData(); break;
     case 'dist-next-page': await fetchDistPage('next'); break;
     case 'dist-prev-page': await fetchDistPage('prev'); break;
     case 'dist-page': await goToDistPage(target.dataset.page); break;
     case 'dist-retry': await fetchDistPage('first'); break;
     case 'export-distributions': await exportDistributionsCSV(); break;
-    case 'export-current-page': exportCurrentDistPageCSV(); break;
-    case 'export-my-recent': exportMyRecentDistributionsCSV(); break;
     case 'export-dealers': exportDealersCSV(); break;
     case 'export-duplicates': exportDuplicatesCSV(); break;
-    case 'export-duplicates-full': await exportAllDuplicatesCSV(); break;
     case 'export-report': exportReportCSV(); break;
     case 'set-report-type': state.reportType = target.dataset.type; renderCurrentView(); break;
     case 'retry-charts': initDashboardCharts(); break;
@@ -3674,9 +2800,6 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
       if (record) openDeleteRecordModal(record);
       break;
     }
-    case 'open-add-stock': openAddStockModal(target.dataset.dealerId || null); break;
-    case 'view-stock-history': openStockHistoryModal(target.dataset.dealerId); break;
-    case 'rebuild-stats': await handleRebuildStatsClick(); break;
   }
 });
 document.getElementById('mainApp').addEventListener('submit', async (e) => {
@@ -3688,22 +2811,11 @@ document.getElementById('mainApp').addEventListener('submit', async (e) => {
   else if (id === 'changePasswordForm') await handleChangePasswordSubmit(e.target);
 });
 document.getElementById('mainApp').addEventListener('change', (e) => {
-  if (e.target.dataset && e.target.dataset.stockSearch !== undefined) {
-    state.stockSearch = e.target.value;
-    renderCurrentView();
-    return;
-  }
   if (e.target.dataset && e.target.dataset.filter) {
     state.filters[e.target.dataset.filter] = e.target.value;
     if (currentView === 'distributions' || currentView === 'history') {
       resetAndLoadDistPage(); // filter changed → fresh server-side query, not a client-side re-slice
     } else {
-      // systemLogs/duplicates paginate client-side over an already-loaded
-      // bounded window (see RECENT_WINDOW) — a filter change just re-slices
-      // that window, so jump back to page 1 instead of leaving pageNumber
-      // pointed past the newly (possibly much shorter) filtered result.
-      if (currentView === 'systemLogs') logPage.pageNumber = 1;
-      if (currentView === 'duplicates') dupPage.pageNumber = 1;
       renderCurrentView();
     }
     return;
@@ -3729,14 +2841,10 @@ document.getElementById('mainApp').addEventListener('change', (e) => {
 document.getElementById('modalRoot').addEventListener('click', (e) => {
   if (e.target.closest('[data-action="close-modal"]')) closeModal();
 });
-document.getElementById('modalRoot').addEventListener('change', (e) => {
-  if (e.target.form && e.target.form.id === 'addStockForm') updateAddStockCurrentInfo();
-});
 document.getElementById('modalRoot').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (e.target.id === 'editDealerForm') await handleEditDealerSubmit(e.target);
   else if (e.target.id === 'deleteDistributionForm') await handleDeleteDistributionSubmit(e.target);
-  else if (e.target.id === 'addStockForm') await handleAddStockSubmit(e.target);
 });
 document.addEventListener('keydown', async (e) => {
   if (e.target && e.target.id === 'farmerSearchInput' && e.key === 'Enter') {
